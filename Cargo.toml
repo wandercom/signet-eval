@@ -42,7 +42,7 @@ rpassword = "7"
 chrono = "0.4"
 
 # MCP (optional — only needed for proxy/management server modes)
-rmcp = { version = "1", features = ["server", "client", "transport-io", "transport-child-process"], optional = true }
+rmcp = { version = "2", features = ["server", "client", "transport-io", "transport-child-process"], optional = true }
 tokio = { version = "1", features = ["full"], optional = true }
 schemars = { version = "0.8", optional = true }
 async-trait = { version = "0.1", optional = true }
