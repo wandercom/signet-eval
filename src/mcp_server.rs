@@ -19,12 +19,15 @@ fn rules_path() -> PathBuf {
     vault::signet_dir().join("rules.yaml")
 }
 
-fn load_policy_raw() -> PolicyConfig {
+fn load_policy_effective() -> PolicyConfig {
     let path = policy_path();
-    match std::fs::read_to_string(&path) {
-        Ok(content) => serde_yaml::from_str(&content).unwrap_or_default(),
-        Err(_) => PolicyConfig::default(),
-    }
+    crate::policy::load_effective_policy_config(&path)
+        .unwrap_or_else(|_| crate::policy::baseline_system_config())
+}
+
+// Mutation paths preserve the serialized policy rather than writing the overlay.
+fn load_policy_raw() -> PolicyConfig {
+    crate::policy::load_policy_config(&policy_path()).unwrap_or_default()
 }
 
 fn load_rules_raw() -> Vec<PolicyRule> {
@@ -298,7 +301,7 @@ impl ServerHandler for SignetMcpServer {
 // === Tool Handlers ===
 
 fn handle_list_rules() -> String {
-    let config = load_policy_raw();
+    let config = load_policy_effective();
     let user_rules = load_rules_raw();
     let merged = crate::policy::merge_rules(&config.rules, &user_rules);
     if merged.is_empty() {
@@ -451,7 +454,7 @@ fn handle_add_rule(args: &serde_json::Map<String, Value>) -> String {
     };
 
     // Check name uniqueness across both system and user rules
-    let system_config = load_policy_raw();
+    let system_config = load_policy_effective();
     let mut user_rules = load_rules_raw();
     if system_config.rules.iter().any(|r| r.name == name) {
         return format!(
@@ -482,7 +485,7 @@ fn handle_add_rule(args: &serde_json::Map<String, Value>) -> String {
 fn handle_remove_rule(args: &serde_json::Map<String, Value>) -> String {
     let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
     // Check if it's a locked system rule
-    let system_config = load_policy_raw();
+    let system_config = load_policy_effective();
     if let Some(rule) = system_config.rules.iter().find(|r| r.name == name) {
         if rule.locked {
             return format!("Cannot remove rule '{name}': rule is locked (self-protection).");
@@ -547,7 +550,7 @@ fn handle_set_limit(args: &serde_json::Map<String, Value>) -> String {
 }
 
 fn handle_status() -> String {
-    let config = load_policy_raw();
+    let config = load_policy_effective();
     let mut lines = vec![format!(
         "Policy: {} rules (default: {:?})",
         config.rules.len(),
@@ -667,7 +670,7 @@ fn handle_validate(args: &serde_json::Map<String, Value>) -> String {
     match crate::policy::load_policy_config(&path) {
         Ok(mut config) => {
             if fix {
-                let result = crate::policy::fix_policy(&mut config);
+                let result = crate::policy::fix_system_policy(&mut config);
                 if result.rules_removed.is_empty() && result.rules_modified.is_empty() {
                     lines.push(format!(
                         "No auto-fixable issues. {} rules.",
@@ -679,7 +682,7 @@ fn handle_validate(args: &serde_json::Map<String, Value>) -> String {
                     auto_sign();
                 }
             }
-            let diagnostics = crate::policy::validate_policy(&config);
+            let diagnostics = crate::policy::validate_system_policy(&config);
             if diagnostics.is_empty() {
                 lines.push(format!("Valid: {} rules.", config.rules.len()));
             } else {
@@ -758,7 +761,7 @@ fn handle_reorder_rule(args: &serde_json::Map<String, Value>) -> String {
     }
 
     // Check if it's a system/locked rule
-    let system_config = load_policy_raw();
+    let system_config = load_policy_effective();
     if system_config
         .rules
         .iter()
@@ -792,7 +795,7 @@ fn handle_reorder_rule(args: &serde_json::Map<String, Value>) -> String {
 fn handle_edit_rule(args: &serde_json::Map<String, Value>) -> String {
     let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
     // Check if it's a system/locked rule
-    let system_config = load_policy_raw();
+    let system_config = load_policy_effective();
     if system_config
         .rules
         .iter()

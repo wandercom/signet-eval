@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Fixed
+- Retired binary-owned identity rules are excluded consistently from effective CLI and MCP policy views and validation. User-authored rules and check files remain untouched.
+- User-managed ENSURE scripts receive the original command and call working directory as literal `SIGNET_TOOL_COMMAND` and `SIGNET_TOOL_CWD` environment values, alongside normalized stdin. No personal account defaults are installed.
+
+### Removed
+- `github_identity_guard` and its embedded `gh-identity-matches-remote` check. The script hardcoded one developer's owner-to-account map (`wandercom`, `meacjis`, everything else to `jmcentire`), so on any other machine it denied every `git push`/`pull`/`fetch`/`clone` and `gh` call, and deleting the script didn't help because the binary rewrote it on the next matching call. A copy of the rule in an existing `policy.yaml` snapshot is dropped on load. An existing `~/.signet/checks/gh-identity-matches-remote` is left in place; no built-in rule invokes it, but an explicit user-authored ENSURE rule can still do so. Delete it by hand if no longer wanted. Anyone who wants identity enforcement can keep their own script and add an `ENSURE` rule to `rules.yaml`.
+
+### Fixed
 - The optional Claude function adapter loads again. Claude Code 2.1.274 names settings-hook events under `classic.` and refuses a hooks module that registers the bare `PreToolUse` event, so on that build the whole module failed to load. Because `install-modern` retires the legacy command hooks, Claude sessions then ran with no Signet enforcement at all. The adapter now registers `classic.PreToolUse`, which keeps the same input envelope and `allow` / `ask` / `deny` result.
 
 ### Changed

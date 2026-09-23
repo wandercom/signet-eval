@@ -30,5 +30,22 @@ jobs:
         run: cargo +stable test --workspace --release --locked --no-default-features --no-fail-fast -- --test-threads=1
       - name: Release binary
         run: cargo +stable build --release --locked
+      - name: Python acceptance tests (PR16)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SIGNET_EVAL_BINARY="${GITHUB_WORKSPACE}/target/release/signet-eval"
+          if [ ! -x "${SIGNET_EVAL_BINARY}" ]; then
+            echo "Missing release binary: ${SIGNET_EVAL_BINARY}" >&2
+            exit 1
+          fi
+          TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"
+          export TMPDIR
+          echo "SIGNET_EVAL_BINARY=${SIGNET_EVAL_BINARY}"
+          echo "TMPDIR=${TMPDIR}"
+          status=0
+          python3 tests/test_pr16_behavior.py || status=1
+          python3 tests/test_mcp_behavior.py || status=1
+          exit "${status}"
       - name: Verify packaged source and embedded adapter
         run: cargo +stable package --locked

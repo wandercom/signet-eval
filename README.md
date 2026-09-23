@@ -161,6 +161,30 @@ rules:
 
 Rules are evaluated in order — first match wins. Multiple conditions on a rule are AND'd. Rules with `locked: true` cannot be modified through the MCP management server.
 
+## ENSURE check context
+
+User-managed ENSURE scripts receive the original normalized tool name and input
+on stdin. `SIGNET_TOOL_COMMAND` carries the normalized `command` (or `cmd`) as a
+literal environment value; it is empty for noncommand tools without those fields.
+The forwarding mechanism does not interpret that value as shell code.
+
+`SIGNET_TOOL_CWD` uses the normalized tool `cwd`/`workdir`, then the host envelope's
+`cwd`, then the hook process's working directory. The process fallback is not an
+independently verified execution directory. These values describe supplied call
+context, not a trusted location attestation: missing, malformed, or empty context
+must not be treated by a check as proof of where the requested command will run.
+Both environment values replace inherited values; stdin remains unchanged.
+
+From the repository root after `cargo build --release`, run the independent local
+acceptance checks with:
+
+```bash
+SIGNET_EVAL_BINARY="$(pwd)/target/release/signet-eval" python3 tests/test_pr16_behavior.py
+```
+
+These Python acceptance checks can run locally and are also collected by hosted
+CI on Linux and macOS against the release binary, alongside Rust and packaging checks.
+
 ## Advisory Injection
 
 `INJECT` rules probabilistically add advisory context near the tool call that

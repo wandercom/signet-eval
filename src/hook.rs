@@ -355,6 +355,10 @@ pub fn run_hook_with_adapter(
             .and_then(|value| value.as_str()),
     );
 
+    let envelope_cwd = raw_input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let call = match parse_tool_call_input(raw_input, adapter) {
         Ok(call) => call,
         Err(_) => {
@@ -373,8 +377,8 @@ pub fn run_hook_with_adapter(
             return 0;
         }
         if result.decision == Decision::Ensure && result.matched_locked {
-            // Self-protection: locked ensure (e.g., identity guard) enforced during pause
-            let resolved = resolve_ensure_result(result, &call);
+            // Self-protection: locked ensure enforced during pause
+            let resolved = resolve_ensure_result_with_cwd(result, &call, envelope_cwd.as_deref());
             if resolved.decision == Decision::Deny {
                 emit_decision(adapter, event, "deny", resolved.reason, None);
                 return 0;
@@ -390,7 +394,7 @@ pub fn run_hook_with_adapter(
 
     // Resolve Ensure: run check script, convert to Allow/Deny
     let result = if result.decision == Decision::Ensure {
-        resolve_ensure_result(result, &call)
+        resolve_ensure_result_with_cwd(result, &call, envelope_cwd.as_deref())
     } else {
         result
     };
@@ -732,10 +736,15 @@ fn emit_deny(adapter: HookAdapter, event: HookEvent, reason: &str) {
 /// For unlocked rules, missing scripts resolve gracefully (allow).
 /// For locked rules, missing scripts fail closed (deny).
 fn resolve_ensure(config: &EnsureConfig, locked: bool, call: &ToolCall) -> (bool, String) {
-    if let Err(error) = crate::embedded_checks::install_if_builtin(&config.check) {
-        return (false, error);
-    }
+    resolve_ensure_with_cwd(config, locked, call, None)
+}
 
+fn resolve_ensure_with_cwd(
+    config: &EnsureConfig,
+    locked: bool,
+    call: &ToolCall,
+    envelope_cwd: Option<&str>,
+) -> (bool, String) {
     let script_path = match policy::resolve_ensure_script_path(&config.check) {
         Ok(p) => p,
         Err(e) => {
@@ -775,24 +784,32 @@ fn resolve_ensure(config: &EnsureConfig, locked: bool, call: &ToolCall) -> (bool
         );
     }
 
+    // Forward context as literal child environment values, never shell source.
+    let tool_command = call
+        .parameters
+        .get("command")
+        .or_else(|| call.parameters.get("cmd"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let tool_cwd = call
+        .parameters
+        .get("cwd")
+        .or_else(|| call.parameters.get("workdir"))
+        .and_then(Value::as_str)
+        .or(envelope_cwd)
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
     let mut command = Command::new(&script_path);
     command
+        .env("SIGNET_TOOL_COMMAND", tool_command)
+        .env("SIGNET_TOOL_CWD", tool_cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    if config.check == crate::embedded_checks::GITHUB_IDENTITY_CHECK {
-        if let Some(command_text) = call.parameters.get("command").and_then(|v| v.as_str()) {
-            command.env("SIGNET_TOOL_COMMAND", command_text);
-        }
-        if let Some(call_cwd) = call
-            .parameters
-            .get("workdir")
-            .or_else(|| call.parameters.get("cwd"))
-            .and_then(|v| v.as_str())
-        {
-            command.env("SIGNET_TOOL_CWD", call_cwd);
-        }
-    }
 
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -836,8 +853,22 @@ fn resolve_ensure(config: &EnsureConfig, locked: bool, call: &ToolCall) -> (bool
 
 /// Resolve an Ensure evaluation result by running the check script.
 pub(crate) fn resolve_ensure_result(result: EvaluationResult, call: &ToolCall) -> EvaluationResult {
+    resolve_ensure_result_with_cwd(result, call, None)
+}
+
+/// Host cwd is execution context only; it never changes authorization parameters.
+pub(crate) fn resolve_ensure_result_with_cwd(
+    result: EvaluationResult,
+    call: &ToolCall,
+    envelope_cwd: Option<&str>,
+) -> EvaluationResult {
     if let Some(ref ensure_config) = result.ensure_config {
-        let (passed, stderr) = resolve_ensure(ensure_config, result.matched_locked, call);
+        let (passed, stderr) = match envelope_cwd {
+            Some(cwd) => {
+                resolve_ensure_with_cwd(ensure_config, result.matched_locked, call, Some(cwd))
+            }
+            None => resolve_ensure(ensure_config, result.matched_locked, call),
+        };
         if passed {
             EvaluationResult {
                 decision: Decision::Allow,

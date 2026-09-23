@@ -137,19 +137,6 @@
     Relaying this to the agent helps it take corrective action voluntarily.
   affected_components: [policy.rs, hook.rs]
 
-- id: C011
-  boundary: Git Remote Identity Matching
-  condition: >
-    The gh-identity-matches-remote check script must handle: (a) remote URL contains
-    "jmcentire" -> require jmcentire account, (b) remote URL contains "wandercom" ->
-    require jmc-wander account, (c) remote URL contains neither -> prompt user to choose,
-    (d) not inside a git repo (e.g., gh commands without a repo context) -> pass through
-    with a warning, (e) multiple remotes -> check the remote being targeted (default: origin).
-  violation: Wrong-account operations proceed unchecked.
-  severity: must
-  rationale: This is the motivating use case. The script must cover all realistic scenarios.
-  affected_components: [checks/gh-identity-matches-remote]
-
 - id: C012
   boundary: MCP Tool Support
   condition: >

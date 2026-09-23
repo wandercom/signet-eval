@@ -50,13 +50,6 @@ components:
       - "signet-eval rules: show gate/ensure config"
     constraints: []
 
-  - name: checks/gh-identity-matches-remote
-    description: Shell script - validates GitHub identity matches git remote
-    location: "~/.signet/checks/gh-identity-matches-remote"
-    changes:
-      - "New file: check script for GitHub identity validation"
-    constraints: [C011]
-
 edges:
   - from: hook.rs
     to: policy.rs
