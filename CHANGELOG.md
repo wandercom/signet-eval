@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Restored MCP proxy and management server builds with rmcp 2 by using its renamed text-content constructor.
+
 ## [3.12.2] - 2026-08-27
 
 ### Added

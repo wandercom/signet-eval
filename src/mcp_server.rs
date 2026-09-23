@@ -290,7 +290,7 @@ impl ServerHandler for SignetMcpServer {
                 "signet_preflight_test" => handle_preflight_test(args),
                 _ => format!("Unknown tool: {}", request.name),
             };
-            Ok(CallToolResult::success(vec![Content::text(result)]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
         }
     }
 }

@@ -160,20 +160,20 @@ impl ServerHandler for ProxyServer {
             match result.decision {
                 Decision::Deny => {
                     let reason = result.reason.unwrap_or_else(|| "Denied by policy".into());
-                    Ok(CallToolResult::error(vec![Content::text(format!(
+                    Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "DENIED by Signet: {reason}"
                     ))]))
                 }
                 Decision::Ask => {
                     let reason = result.reason.unwrap_or_else(|| "Requires approval".into());
-                    Ok(CallToolResult::error(vec![Content::text(format!(
+                    Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "REQUIRES APPROVAL: {reason}"
                     ))]))
                 }
                 Decision::Gate => {
                     // Gate should be resolved by evaluate() — safety net
                     let reason = result.reason.unwrap_or_else(|| "Gate check failed".into());
-                    Ok(CallToolResult::error(vec![Content::text(format!(
+                    Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "DENIED by Signet: {reason}"
                     ))]))
                 }
@@ -181,7 +181,7 @@ impl ServerHandler for ProxyServer {
                     let reason = result
                         .reason
                         .unwrap_or_else(|| "Ensure checks cannot run in proxy mode".into());
-                    Ok(CallToolResult::error(vec![Content::text(format!(
+                    Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "DENIED by Signet: {reason}"
                     ))]))
                 }
@@ -198,12 +198,12 @@ impl ServerHandler for ProxyServer {
                             fwd.arguments = request.arguments.clone();
                             match u.client.peer().call_tool(fwd).await {
                                 Ok(r) => Ok(r),
-                                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "Upstream error: {e}"
-                                ))])),
+                                Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                                    format!("Upstream error: {e}"),
+                                )])),
                             }
                         }
-                        None => Ok(CallToolResult::error(vec![Content::text(format!(
+                        None => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                             "Unknown upstream: {server_name}"
                         ))])),
                     }
@@ -218,9 +218,9 @@ impl ServerHandler for ProxyServer {
                             fwd.arguments = request.arguments.clone();
                             match u.client.peer().call_tool(fwd).await {
                                 Ok(r) => Ok(r),
-                                Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
-                                    "Upstream error: {e}"
-                                ))])),
+                                Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(
+                                    format!("Upstream error: {e}"),
+                                )])),
                             }
                         }
                         None => Err(McpError::invalid_params(
