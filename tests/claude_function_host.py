@@ -1,4 +1,4 @@
-"""Offline Claude 2.1.263 host acceptance probe; synthetic provider, isolated state.
+"""Offline Claude 2.1.274 host acceptance probe; synthetic provider, isolated state.
 
 Run after cargo build. Does not enable plugins in the user's configuration.
 Artifacts are retained in a newly allocated temporary directory for inspection.

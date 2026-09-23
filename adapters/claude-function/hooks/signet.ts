@@ -1,6 +1,6 @@
 import type { Register } from "claude-code";
 
-const REVISION = "claude-functions-2.1.263-v1";
+const REVISION = "claude-functions-2.1.274-v1";
 const FAILURE = "Signet-eval is unavailable for this operation. Reconfigure the selected owner; do not bypass it.";
 
 export const register: Register = (on, options) => {
@@ -34,7 +34,7 @@ export const register: Register = (on, options) => {
       return next({...e,text:response.value});
     } catch { return {drop:FAILURE}; }
   });
-  on("PreToolUse", async ($, e, next) => {
+  on("classic.PreToolUse", async ($, e, next) => {
     if (conflict) return {deny:FAILURE};
     try {
       const {tool, tool_use_id, ...tool_input} = e;

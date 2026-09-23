@@ -5,10 +5,12 @@ binary. It starts no service. Legacy Claude command hooks, Codex, Antigravity an
 OpenCode remain separate: they do not import this adapter, poll it, or require
 Claude's function API. Removing this directory removes the modern adapter.
 
-The adapter targets the early-access API emitted by Claude Code **2.1.263** with
+The adapter targets the early-access API emitted by Claude Code **2.1.274** with
 `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. Other runtime revisions are not qualified.
 The flag also works through `settings.json`'s `env` object in an isolated
-2.1.263 probe; no shell-profile change is required for that activation path.
+2.1.274 probe; no shell-profile change is required for that activation path.
+Settings-hook events are named under `classic.` in this API (`classic.PreToolUse`);
+2.1.274 rejects a module that registers the bare `PreToolUse` name used on 2.1.263.
 Use `/plugin-types` in an isolated directory to obtain the host declarations.
 The host's module checker is stricter than ordinary TypeScript.
 
@@ -102,7 +104,7 @@ arbitrary shell text read-only. Other binary/directory self-protection is unchan
 
 All four `integration` subcommands accept JSON stdin and return one JSON object.
 Inputs are bounded to 4 MiB; invalid input returns fixed errors without echoing it.
-Protocol version is `1`; adapter revision is `claude-functions-2.1.263-v1`.
+Protocol version is `1`; adapter revision is `claude-functions-2.1.274-v1`.
 
 `describe` accepts `{session_id, project_path, agent}`. `project_path` is the
 absolute actual worktree directory, not the main checkout returned by Claude's

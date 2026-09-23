@@ -17,11 +17,19 @@ fn install(dir: &Path) -> Value {
 }
 
 fn fixture() -> tempfile::TempDir {
+    fixture_with_claude("2.1.274")
+}
+
+fn fixture_with_claude(version: &str) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("bin")).unwrap();
     let claude = dir.path().join("bin/claude");
-    fs::write(&claude, "#!/bin/sh\necho '2.1.263 (Claude Code)'\n").unwrap();
+    fs::write(
+        &claude,
+        format!("#!/bin/sh\necho '{version} (Claude Code)'\n"),
+    )
+    .unwrap();
     fs::set_permissions(claude, fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir_all(dir.path().join("claude")).unwrap();
     dir
@@ -75,6 +83,25 @@ fn embedded_install_retires_owned_handlers_preserves_foreign_and_disabled_state(
     assert!(Path::new(repeated["backup_path"].as_str().unwrap())
         .join("previous-plugin/hooks/signet.ts")
         .exists());
+}
+
+#[test]
+fn installer_refuses_unqualified_claude_without_changing_settings() {
+    // 2.1.263 was the previous qualification: its API named the event
+    // `PreToolUse`, which this adapter no longer registers.
+    let dir = fixture_with_claude("2.1.263");
+    let raw =
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"signet-eval"}]}]}}"#;
+    fs::write(dir.path().join("claude/settings.json"), raw).unwrap();
+    assert_eq!(
+        install(dir.path())["error"],
+        "unqualified_claude_version_use_legacy"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("claude/settings.json")).unwrap(),
+        raw
+    );
+    assert!(!dir.path().join("claude/skills").exists());
 }
 
 #[test]

@@ -1,7 +1,7 @@
 {
   "name": "signet-eval-functions",
   "version": "3.12.2",
-  "description": "Optional Claude Code 2.1.263 function hooks for Signet-eval policy and output redaction",
+  "description": "Optional Claude Code 2.1.274 function hooks for Signet-eval policy and output redaction",
   "author": {"name": "Wander"},
   "userConfig": {
     "enabled": {"type": "boolean", "title": "Enable adapter", "description": "Activate this adapter after removing legacy Signet hook registrations", "default": false},

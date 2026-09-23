@@ -8,6 +8,10 @@ use std::{
 };
 
 const NAME: &str = "signet-eval-functions";
+/// The one Claude Code build the embedded adapter was qualified against. The
+/// function-hook API is early access and renames events between releases, so a
+/// module written for one build can fail to load on the next.
+const QUALIFIED_CLAUDE_VERSION: &str = "2.1.274";
 const ASSETS: [(&str, &str); 3] = [
     (
         ".claude-plugin/plugin.json",
@@ -127,7 +131,7 @@ pub fn install_modern() -> Result<Value, &'static str> {
         || String::from_utf8_lossy(&version.stdout)
             .split_whitespace()
             .next()
-            != Some("2.1.263")
+            != Some(QUALIFIED_CLAUDE_VERSION)
     {
         return Err("unqualified_claude_version_use_legacy");
     }
