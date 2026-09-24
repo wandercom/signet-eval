@@ -5,11 +5,25 @@
 //! Runs the CLI's policy-test interface; never executes supplied shell commands.
 //! Missing policy/rules and isolated HOME/SIGNET_DIR force deterministic defaults.
 use serde_json::{json, Value};
-use std::process::Command;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn evaluate_case(input: Value) -> (String, String) {
+    evaluate_with_executable(&test_executable(), input)
+}
+
+fn test_executable() -> PathBuf {
+    std::env::var_os("SIGNET_GUARD_TEST_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_signet-eval")))
+}
+
+fn evaluate_with_executable(executable: &Path, input: Value) -> (String, String) {
     let dir = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_signet-eval"))
+    let output = Command::new(executable)
         .args([
             "--policy-path",
             dir.path().join("absent-policy.yaml").to_str().unwrap(),
@@ -160,4 +174,107 @@ fn ambiguous_relative_binary_write_remains_protected() {
         rule, "protect_signet_binary",
         "B2 relative binary target reaches protection"
     );
+}
+
+#[test]
+fn wrapped_control_invocations_reach_binary_protection() {
+    // B3 release-blocker extension: wrappers change launch mechanics, not the
+    // protected control. Exact rule assertions exclude unrelated denials.
+    for command in [
+        "nice signet-eval disable",
+        "nice -n 5 signet-eval disable",
+        "nice --adjustment=5 signet-eval pause",
+        "nohup signet-eval disable",
+        "nohup -- signet-eval reset-session",
+        "timeout 10s signet-eval disable",
+        "timeout --signal=TERM -k 1s 10s signet-eval pause",
+        "timeout -s TERM -k 1s 10s signet-eval reset-session",
+        "timeout --foreground 10s signet-eval disable",
+        "nice -n 5 nohup timeout 10s signet-eval disable",
+        "env FOO=bar timeout -s TERM 10s nice -n 5 nohup signet-eval pause",
+        "command nohup nice -n 5 timeout --signal=TERM 10s signet-eval --adapter claude disable",
+    ] {
+        let (decision, rule) = evaluate_case(json!({
+            "tool_name":"Bash", "tool_input":{"command":command}
+        }));
+        assert_eq!(decision, "Deny", "B3 wrapped control: {command}");
+        assert_eq!(
+            rule, "protect_signet_binary",
+            "B3 wrapper must reach exact guard: {command}"
+        );
+    }
+}
+
+#[test]
+fn custom_and_renamed_running_binary_targets_remain_protected() {
+    // B2 release-blocker extension: the executable answering policy-test is
+    // the installed owner, including custom directories and renamed binaries.
+    // Only policy-test is launched; every mutation string remains JSON data.
+    for name in ["signet-eval", "policy-owner-custom"] {
+        let installation = tempfile::tempdir().unwrap();
+        let directory = installation.path().join("custom tools");
+        fs::create_dir(&directory).unwrap();
+        let installed = directory.join(name);
+        fs::copy(test_executable(), &installed).unwrap();
+        let installed = installed.canonicalize().unwrap();
+        let quoted = format!("'{}'", installed.to_str().unwrap().replace('\'', "'\\''"));
+        for command in [
+            format!("cp /dev/null {quoted}"),
+            format!("printf replacement > {quoted}"),
+            format!("chmod -x {quoted}"),
+        ] {
+            let (decision, rule) = evaluate_with_executable(
+                &installed,
+                json!({
+                    "tool_name":"Bash", "tool_input":{"command":command}
+                }),
+            );
+            assert_eq!(
+                decision, "Deny",
+                "B2 actual running binary mutation: {command}"
+            );
+            assert_eq!(
+                rule, "protect_signet_binary",
+                "B2 actual owner must reach binary guard: {command}"
+            );
+        }
+        for (tool, input) in [
+            (
+                "Write",
+                json!({"file_path":installed,"content":"replacement"}),
+            ),
+            (
+                "Edit",
+                json!({"file_path":installed,"old_string":"old","new_string":"replacement"}),
+            ),
+        ] {
+            let (decision, rule) = evaluate_with_executable(
+                &installed,
+                json!({
+                    "tool_name":tool, "tool_input":input
+                }),
+            );
+            assert_eq!(
+                decision, "Deny",
+                "B2 direct actual owner mutation: {tool} {name}"
+            );
+            assert_eq!(
+                rule, "protect_signet_binary",
+                "B2 direct owner target reaches guard"
+            );
+        }
+        // B1 still holds with a custom owner: repository paths and prose are
+        // not binary targets, even when prose names the actual executable.
+        for input in [
+            json!({"tool_name":"Bash","tool_input":{"command":"cat /workspace/projects/signet-eval/README.md"}}),
+            json!({"tool_name":"Bash","tool_input":{"command":"ls /workspace/projects/signet-eval/src"}}),
+            json!({"tool_name":"Write","tool_input":{"file_path":"/workspace/notes.md","content":format!("Installed owner: {}", installed.display())}}),
+        ] {
+            let (_, rule) = evaluate_with_executable(&installed, input);
+            assert_ne!(
+                rule, "protect_signet_binary",
+                "B1 inert reference under custom owner {name}"
+            );
+        }
+    }
 }

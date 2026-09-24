@@ -156,11 +156,13 @@ arbitrary content, issue text, or repository identifiers for the product name.
 A non-match grants no permission: remaining policy rules still evaluate.
 
 The guard recognizes `/opt/homebrew/bin`, `/usr/local/bin`, and `.cargo/bin`
-executable locations, including slash/backslash forms, common home-directory
+executable locations and the running owner’s actual executable path, including custom
+install directories and renamed binaries. Matching covers slash/backslash forms, common home-directory
 spellings, `.exe` names, and simple redundant dot/cancelled path segments.
 References to those installed paths are conservatively protected even in shell
 read commands. Direct executable invocations (including through ordinary `env`, `command`,
-`exec`, `sudo`, leading variable assignments, and literal
+`exec`, `sudo`, `nice`, `nohup`, `timeout`, `setsid`, `stdbuf`, `ionice`,
+`time`, leading variable assignments, and literal
 `sh`/`bash`/`zsh`/`dash`/`ksh` command strings using `-c`, `-lc`, or `-ec`) and common file mutations targeting
 a relative executable basename are also protected, since the working directory
 could be an installation directory. Structured relative executable targets are
@@ -172,7 +174,7 @@ reaches every other rule, and structured target paths are never transformed.
 
 This is a bounded lexical guard, not shell parsing or resolved-path security.
 Quoted shell examples containing command separators can conservatively match;
-encoded commands, arbitrary wrappers, uncommon installation directories, shell
+encoded commands, arbitrary wrappers, other non-running custom installations, shell
 expansion and filesystem aliases are not completely modeled. Existing directory,
 symlink, process, identity and destructive-operation rules remain independent.
 
