@@ -22,6 +22,13 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt
       - name: Formatting
         run: cargo +stable fmt --all --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Claude adapter recovery contract
+        run: |
+          node tests/claude_adapter_recovery.mjs adapters/claude-function/hooks/signet.ts
+          node tests/claude_host_errors.mjs adapters/claude-function/hooks/signet.ts
       - name: Tests with MCP
         # The suite includes wall-clock budgets. Exercise optimized code without
         # contending with the suite's Argon2 tests on shared runners.
@@ -30,5 +37,19 @@ jobs:
         run: cargo +stable test --workspace --release --locked --no-default-features --no-fail-fast -- --test-threads=1
       - name: Release binary
         run: cargo +stable build --release --locked
+      - name: Python acceptance tests (PR15)
+        shell: bash
+        run: |
+          set -euo pipefail
+          export SIGNET_EVAL_BINARY="${GITHUB_WORKSPACE}/target/release/signet-eval"
+          if [ ! -x "${SIGNET_EVAL_BINARY}" ]; then
+            echo "Missing release binary: ${SIGNET_EVAL_BINARY}" >&2
+            exit 1
+          fi
+          TMPDIR="$(python3 -c 'import os, tempfile; print(os.path.realpath(tempfile.gettempdir()))')"
+          export TMPDIR
+          echo "SIGNET_EVAL_BINARY=${SIGNET_EVAL_BINARY}"
+          echo "TMPDIR=${TMPDIR}"
+          python3 tests/test_pr15_behavior.py
       - name: Verify packaged source and embedded adapter
         run: cargo +stable package --locked

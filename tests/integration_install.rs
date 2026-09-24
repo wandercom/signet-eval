@@ -105,6 +105,36 @@ fn installer_refuses_unqualified_claude_without_changing_settings() {
 }
 
 #[test]
+fn installer_accepts_exact_qualified_builds() {
+    for version in ["2.1.274", "2.1.280"] {
+        let dir = fixture_with_claude(version);
+        assert_eq!(install(dir.path())["status"], "installed", "{version}");
+    }
+}
+
+#[test]
+fn installer_refuses_unqualified_builds() {
+    for version in [
+        "2.1.273",
+        "2.1.275",
+        "2.1.277",
+        "2.1.279",
+        "2.1.281",
+        "2.2.0",
+        "2.1.280-beta",
+        "2.1",
+    ] {
+        let dir = fixture_with_claude(version);
+        assert_eq!(
+            install(dir.path())["error"],
+            "unqualified_claude_version_use_legacy",
+            "{version}"
+        );
+        assert!(!dir.path().join("claude/skills").exists(), "{version}");
+    }
+}
+
+#[test]
 fn installer_refuses_unknown_wrappers_without_changing_settings() {
     let dir = fixture();
     let raw = r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"signet-eval && foreign-check"}]}]}}"#;
@@ -144,4 +174,40 @@ fn installer_refuses_unowned_or_linked_plugin_directories() {
         fs::read_to_string(target.join(".claude-plugin/plugin.json")).unwrap(),
         r#"{"name":"foreign-plugin"}"#
     );
+}
+
+#[test]
+fn recovery_installer_accepts_both_qualified_hosts_preserving_disable_and_foreign_hooks() {
+    // R7: Validator's 2026-09-24 repair contract qualifies exact 2.1.280,
+    // preserves 2.1.274, and never broadens that qualification to unknown hosts.
+    // Mutation witness: omit either qualified version, enable enforcement during
+    // install, or remove a foreign hook. Existing 2.1.263 refusal is a green guard.
+    for version in ["2.1.274", "2.1.280"] {
+        let dir = fixture_with_claude(version);
+        fs::create_dir(dir.path().join("state")).unwrap();
+        fs::write(dir.path().join("state/disabled"), "operator-disabled").unwrap();
+        let original = json!({"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"foreign-check"}]}]}});
+        fs::write(
+            dir.path().join("claude/settings.json"),
+            original.to_string(),
+        )
+        .unwrap();
+        let result = install(dir.path());
+        assert_eq!(result["status"], "installed", "host {version}: {result}");
+        let settings: Value =
+            serde_json::from_slice(&fs::read(dir.path().join("claude/settings.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            settings["hooks"], original["hooks"],
+            "host {version}: foreign hooks changed"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("state/disabled")).unwrap(),
+            "operator-disabled"
+        );
+        assert_eq!(result["enforcement_disabled"], true);
+        assert!(Path::new(result["plugin_path"].as_str().unwrap())
+            .join("hooks/signet.ts")
+            .is_file());
+    }
 }

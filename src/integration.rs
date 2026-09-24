@@ -12,7 +12,7 @@ use std::{
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const ADAPTER_REVISION: &str = "claude-functions-2.1.274-v1";
+pub const ADAPTER_REVISION: &str = "claude-functions-2.1.280-v1";
 const TTL_SECONDS: u64 = 30;
 const MAX_INPUT: u64 = 4 * 1024 * 1024;
 

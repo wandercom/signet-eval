@@ -3,7 +3,7 @@
   "name": "io.github.jmcentire/signet-eval",
   "title": "signet-eval",
   "description": "Deterministic policy enforcement and MCP management for AI agent tool calls.",
-  "version": "3.12.2",
+  "version": "3.13.0",
   "repository": {
     "url": "https://github.com/wandercom/signet-eval",
     "source": "github"

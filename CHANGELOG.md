@@ -2,12 +2,21 @@
 
 ## [Unreleased]
 
+## [3.13.0] - 2026-09-24
+
+### Added
+- Optional Claude function adapter with prompt/output redaction, explicit installation, and versioned Kindex task admission receipts. Legacy integrations remain available.
+
 ### Fixed
+- Preserve sanitized host refusal and command-error explanations instead of masking them as `tool_result_unavailable`.
+- Scope binary self-protection to executable references and control invocations; repository names, source paths, and documentation content no longer trigger the binary rule by substring alone. Other policy checks still apply.
+- Claude function hooks recheck current owner state instead of retaining startup conflicts. Confirmed disablement remains neutral, repaired owners recover automatically, and failures report safe diagnostic categories. Recovery prompts remain available with explicit warnings if redaction is unavailable.
 - Restored MCP proxy and management server builds with rmcp 2 by using its renamed text-content constructor.
 - The optional Claude function adapter loads again. Claude Code 2.1.274 names settings-hook events under `classic.` and refuses a hooks module that registers the bare `PreToolUse` event, so on that build the whole module failed to load. Because `install-modern` retires the legacy command hooks, Claude sessions then ran with no Signet enforcement at all. The adapter now registers `classic.PreToolUse`, which keeps the same input envelope and `allow` / `ask` / `deny` result.
 
 ### Changed
-- The function adapter is qualified against Claude Code 2.1.274 instead of 2.1.263. `integration install-modern` now requires 2.1.274, and the adapter revision is `claude-functions-2.1.274-v1`. An installed adapter reports a conflict until the binary and plugin are both upgraded, so rerun `signet-eval integration install-modern` after installing this release.
+- `integration install-modern` accepts exactly Claude Code 2.1.274 and 2.1.280; intermediate builds are rejected. The paired Rust/TypeScript adapter revision is `claude-functions-2.1.280-v1`, and plugin metadata is version 3.13.0. Upgrade the binary and rerun the installer together to avoid a revision conflict.
+- On 2026-09-23, both exact accepted builds passed real Claude host checks with isolated configuration and a synthetic local provider: installed-plugin behavior, Kindex coexistence with native-task denial, and plugin validation. Builds 2.1.275–2.1.279 remain unqualified and rejected; version-probe mocks alone do not establish compatibility.
 
 ## [3.12.2] - 2026-08-27
 
