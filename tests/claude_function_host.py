@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import sqlite3
 import subprocess
 import tempfile
@@ -26,7 +27,12 @@ parser.add_argument("--flag-via-settings", action="store_true")
 parser.add_argument("--unicode", action="store_true")
 parser.add_argument("--deny-native-secret", action="store_true")
 parser.add_argument("--installed-plugin", action="store_true")
+host_error_mode = parser.add_mutually_exclusive_group()
+host_error_mode.add_argument("--deny-bash", action="store_true", help="Verify policy refusal detail and absent shell effect")
+host_error_mode.add_argument("--bash-error", action="store_true", help="Verify real shell failure detail without re-execution")
 args = parser.parse_args()
+if (args.deny_bash or args.bash_error) and (args.kindex_plugin or args.disable_policy or args.disable_before_task or args.deny_task or args.deny_native_secret):
+    parser.error("Bash failure probes require active policy and no task fixture")
 repo = Path(__file__).resolve().parents[1]
 root = Path(tempfile.mkdtemp(prefix="signet-function-host.")).resolve()
 project = root / "project"
@@ -49,6 +55,16 @@ if args.deny_native_secret:
 requests = []
 canary = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890"
 prompt_canary = "synthetic-prompt-value"
+# H1-H3: Validator's host-error repair contract, 2026-09-24.
+# The marker is a real effect witness, independent from the model-visible result.
+marker = project / "bash-effect-marker"
+policy_failure_reason = "Synthetic Bash policy refusal remains visible"
+shell_failure_reason = "Synthetic shell execution failure remains visible"
+if args.deny_bash:
+    (root / "home/.signet/rules.yaml").write_text(
+        "- name: synthetic_bash_refusal\n  tool_pattern: '^Bash$'\n"
+        "  conditions: ['true']\n  action: DENY\n  reason: " + policy_failure_reason + "\n"
+    )
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -73,6 +89,10 @@ class Handler(BaseHTTPRequestHandler):
             tool = "TaskCreate" if args.kindex_plugin else "Bash"
             subject = "api_key=source-policy-canary" if args.deny_native_secret else "Synthetic durable task λ 中文 🔑" if args.unicode else "Synthetic durable task"
             parameters = {"subject": subject, "description": "Offline admission evidence"} if args.kindex_plugin else {"command": "printf '%s\\n' \"$SIGNET_PROBE_OUTPUT\"", "description": "Emit synthetic output"}
+            if args.deny_bash:
+                parameters = {"command": "printf 'executed\\n' >> " + shlex.quote(str(marker)), "description": "Synthetic policy-refused effect"}
+            elif args.bash_error:
+                parameters = {"command": "printf 'executed\\n' >> " + shlex.quote(str(marker)) + "; printf '" + shell_failure_reason + ": %s\\n' \"$SIGNET_PROBE_OUTPUT\" >&2; exit 7", "description": "Synthetic shell failure with one observable effect"}
             block = {"type": "tool_use", "id": "toolu_create", "name": tool, "input": parameters}
         elif args.kindex_plugin and len(results) == 1:
             block = {"type": "tool_use", "id": "toolu_list", "name": "TaskList", "input": {}}
@@ -166,6 +186,17 @@ if args.kindex_plugin:
         with sqlite3.connect(root / "home/.signet/integration.db") as ledger:
             receipt = ledger.execute("SELECT outcome FROM adjudications WHERE operation_id='toolu_create'").fetchone()
         assert receipt and json.loads(receipt[0])["ok"], "reported task receipt not delivered"
+elif args.deny_bash or args.bash_error:
+    assert results[0].get("is_error"), "failed or refused Bash must remain a failure"
+    visible_result = json.dumps(results[0])
+    expected_reason = policy_failure_reason if args.deny_bash else shell_failure_reason
+    assert expected_reason in visible_result, "actual refusal/execution explanation lost in host result"
+    assert expected_reason in json.dumps(requests), "actual explanation not delivered to model"
+    assert canary not in visible_result and not summary["raw_output_in_api"], "raw host-error secret leaked"
+    if args.deny_bash:
+        assert not marker.exists(), "policy-refused shell command produced an effect"
+    else:
+        assert marker.read_text() == "executed\n", "shell effect missing or command executed more than once"
 else:
     assert not results[0].get("is_error"), "Bash did not execute"
     assert summary["raw_output_in_api"] == (args.disable_policy or args.disable_before_task), "output redaction/disabled mismatch"

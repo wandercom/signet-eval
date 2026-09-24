@@ -283,6 +283,9 @@ pub(crate) fn evaluate_condition(
     vault: Option<&Vault>,
 ) -> Result<bool, String> {
     let cond = condition.trim();
+    if cond == "protected_binary_reference()" {
+        return Ok(protected_binary_reference(call));
+    }
     let params_str = call.parameters.to_string();
 
     // contains(parameters, 'substring')
@@ -1144,6 +1147,7 @@ const KNOWN_CONDITION_FNS: &[&str] = &[
     "param_ne",
     "param_contains",
     "matches",
+    "protected_binary_reference",
     "spend_gt",
     "spend_plus_amount_gt",
     "any_of",
@@ -1579,6 +1583,103 @@ pub fn resolve_ensure_script_path(check_name: &str) -> Result<std::path::PathBuf
     Ok(canonical)
 }
 
+/// Lexical executable guard, deliberately scoped to command and target fields.
+/// This does not parse shell programs or resolve paths/symlinks. Known installed
+/// paths are conservative references, even in read-only shell commands. Relative
+/// executable targets are conservative too: the host may be running in a bin dir.
+fn protected_binary_reference(call: &ToolCall) -> bool {
+    static PATTERNS: std::sync::OnceLock<Option<(Regex, Regex)>> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        let name = r"signet[-_]eval(?:\.exe)?";
+        // Tolerate redundant separators and simple dot/cancelled segments.
+        // Symlink resolution and shell expansion remain outside this lexical guard.
+        let sep = r"[\\/]+(?:\.[\\/]+|[^\\/\s\x22\x27;&|<>]+[\\/]+\.\.[\\/]+)*";
+        let installed = format!(
+            r"(?:{sep}opt{sep}homebrew{sep}bin{sep}{name}|{sep}usr{sep}local{sep}bin{sep}{name}|(?:~|\$HOME|\$\{{HOME\}}|%USERPROFILE%|(?:[A-Za-z]:)?[\\/][^\s\x22\x27;&|<>]*?){sep}\.cargo{sep}bin{sep}{name})"
+        );
+        // Harmless shell quotes/escapes in an executable basename still name it.
+        // Never strip backslashes globally: they can be Windows path separators.
+        let shell_word = |word: &str| {
+            let mut pattern = String::new();
+            for character in word.chars() {
+                pattern.push_str(&format!(r"[\x22\x27]*\\?{}", regex::escape(&character.to_string())));
+            }
+            pattern.push_str(r"[\x22\x27]*");
+            pattern
+        };
+        let shell_name = format!(r"(?:{}|{})(?:{})?", shell_word("signet-eval"), shell_word("signet_eval"), shell_word(".exe"));
+        let token_end = r"(?:$|[\s\x22\x27;&|<>])";
+        let installed_command = installed.replace(name, &shell_name);
+        let installed_reference = format!(r"(?:^|[\s\x22\x27=<>;&|]){installed_command}{token_end}");
+        // Ordinary wrapper options/assignments only; no shell execution/parsing.
+        let prefixes = r"(?:(?:(?:env|command|exec|sudo)(?:[ \t]+(?:-[^\s;&|<>]+(?:[ \t]+[^\s;&|<>-]+)?|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+))*|(?:(?:/usr)?/bin/)?(?:sh|bash|zsh|dash|ksh)[ \t]+-(?:c|lc|ec))[ \t]+)*";
+        let slot = r"(?:^|[;&|\n\r\x28])[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+[ \t]+)*";
+        let executable = format!(r"(?:[^\s\x22\x27;&|<>]*[\\/])?{shell_name}");
+        let invocation = format!(r"{slot}{prefixes}{executable}{token_end}");
+        // Cwd may be an installation directory. Protect relative binary targets
+        // for ordinary file mutators and redirects, without inspecting prose.
+        let relative_target = format!(r"(?:\.{sep})*{name}");
+        let relative_command_target = format!(r"(?:\.{sep})*{shell_name}");
+        let relative_mutation = format!(r"{slot}{prefixes}(?:cp|mv|rm|install|chmod|chown|truncate|tee|dd)(?:[ \t]+[^\n\r;&|<>]*)?[ \t=\x22\x27]{relative_command_target}{token_end}");
+        let redirect = format!(r">[ \t]*{relative_command_target}{token_end}");
+        let command = format!(r"(?i)(?:{installed_reference}|{invocation}|{relative_mutation}|{redirect})");
+        let target = format!(r"(?i)^(?:{installed}|{relative_target})$");
+        Some((Regex::new(&command).ok()?, Regex::new(&target).ok()?))
+    });
+    // A broken compiled guard must never silently stop protecting the binary.
+    let Some((command, target)) = patterns else {
+        return true;
+    };
+    // Preserve original Windows/path matching, then add a conservative shell
+    // projection. This only adds denials: it never replaces policy inputs or
+    // normalizes structured paths. It is not a shell parser.
+    let command_reference = |value: &str| {
+        if command.is_match(value) {
+            return true;
+        }
+        if !value.contains(['\\', '\'', '"']) {
+            return false;
+        }
+        let mut projected = String::with_capacity(value.len());
+        let mut escaped = false;
+        for character in value.chars() {
+            if escaped {
+                if character != '\n' {
+                    projected.push(character);
+                }
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character != '\'' && character != '"' {
+                projected.push(character);
+            }
+        }
+        if escaped {
+            projected.push('\\');
+        }
+        command.is_match(&projected)
+    };
+    ["command", "cmd", "CommandLine"].iter().any(|field| {
+        call.parameters
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(command_reference)
+    }) || [
+        "file_path",
+        "path",
+        "target_file",
+        "TargetFile",
+        "destination",
+    ]
+    .iter()
+    .any(|field| {
+        call.parameters
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| target.is_match(value))
+    })
+}
+
 /// Self-protection rules that ship locked in every default policy.
 /// These prevent an AI agent from disabling its own policy enforcement.
 pub fn self_protection_rules() -> Vec<PolicyRule> {
@@ -1624,11 +1725,11 @@ pub fn self_protection_rules() -> Vec<PolicyRule> {
         PolicyRule {
             name: "protect_signet_binary".into(),
             tool_pattern: ".*".into(),
-            conditions: vec!["any_of(parameters, 'signet-eval', 'signet_eval', 'Signet-Eval', 'SIGNET-EVAL', 'SIGNET_EVAL')".into()],
+            conditions: vec!["protected_binary_reference()".into()],
             action: Decision::Deny,
             locked: true,
-            reason: Some("Self-protection: the permissions tool binary is protected.".into()),
-            alternative: Some("Refer to it as 'the permissions tool'. To inspect rules, use signet_list_rules via MCP.".into()),
+            reason: Some("Self-protection: the Signet executable path or direct invocation is protected.".into()),
+            alternative: Some("Use signet_list_rules via MCP to inspect rules; ask the user to change the installed executable or run the executable directly in their terminal.".into()),
             gate: None, ensure: None,
         inject: None,
     },
@@ -2714,6 +2815,36 @@ mod self_protection_tests {
             tool_name: tool.into(),
             parameters: params,
         }
+    }
+
+    // Independent B1/B2 repair guard: a repository name is data; an installed
+    // executable mutation is a protected target. Validator contract 2026-09-24.
+    #[test]
+    fn repository_reference_does_not_disable_installed_binary_protection() {
+        let policy = default_policy();
+        let repository = make_call(
+            "Bash",
+            serde_json::json!({
+                "command": "ls -la /Users/example/Code/signet-eval"
+            }),
+        );
+        let benign = evaluate(&repository, &policy, None);
+        assert_ne!(
+            benign.matched_rule.as_deref(),
+            Some("protect_signet_binary")
+        );
+        let tampering = make_call(
+            "Bash",
+            serde_json::json!({
+                "command": "cp /dev/null /opt/homebrew/bin/signet-eval"
+            }),
+        );
+        let protected = evaluate(&tampering, &policy, None);
+        assert_eq!(protected.decision, Decision::Deny);
+        assert_eq!(
+            protected.matched_rule.as_deref(),
+            Some("protect_signet_binary")
+        );
     }
 
     #[test]
