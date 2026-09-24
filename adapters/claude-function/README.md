@@ -19,6 +19,15 @@ Settings-hook events are named under `classic.` in this API (`classic.PreToolUse
 Use `/plugin-types` in an isolated directory to obtain the host declarations.
 The host's module checker is stricter than ordinary TypeScript.
 
+PR #15 qualified the preceding adapter on both exact hosts on 2026-09-23 with
+isolated configuration and a synthetic provider. Its independent installer tests
+remain in `tests/test_pr15_behavior.py` and run in Linux/macOS CI. Intermediate
+builds remain rejected; those historical probes do not qualify every subsequent
+adapter change or any production model provider.
+
+Run those installer checks after a release build by setting `SIGNET_EVAL_BINARY`
+to the absolute release executable path and invoking the Python test file.
+
 ## Explicit activation
 
 Nothing in a build or package installation enables this adapter. Its `enabled`

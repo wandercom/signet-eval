@@ -105,6 +105,36 @@ fn installer_refuses_unqualified_claude_without_changing_settings() {
 }
 
 #[test]
+fn installer_accepts_exact_qualified_builds() {
+    for version in ["2.1.274", "2.1.280"] {
+        let dir = fixture_with_claude(version);
+        assert_eq!(install(dir.path())["status"], "installed", "{version}");
+    }
+}
+
+#[test]
+fn installer_refuses_unqualified_builds() {
+    for version in [
+        "2.1.273",
+        "2.1.275",
+        "2.1.277",
+        "2.1.279",
+        "2.1.281",
+        "2.2.0",
+        "2.1.280-beta",
+        "2.1",
+    ] {
+        let dir = fixture_with_claude(version);
+        assert_eq!(
+            install(dir.path())["error"],
+            "unqualified_claude_version_use_legacy",
+            "{version}"
+        );
+        assert!(!dir.path().join("claude/skills").exists(), "{version}");
+    }
+}
+
+#[test]
 fn installer_refuses_unknown_wrappers_without_changing_settings() {
     let dir = fixture();
     let raw = r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"signet-eval && foreign-check"}]}]}}"#;
