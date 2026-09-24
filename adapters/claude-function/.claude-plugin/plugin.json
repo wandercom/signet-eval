@@ -1,6 +1,6 @@
 {
   "name": "signet-eval-functions",
-  "version": "3.12.2",
+  "version": "3.13.0",
   "description": "Optional Claude Code 2.1.274 and 2.1.280 function hooks for Signet-eval policy and output redaction",
   "author": {"name": "Wander"},
   "userConfig": {

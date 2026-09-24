@@ -1,6 +1,6 @@
 [package]
 name = "signet-eval"
-version = "3.12.2"
+version = "3.13.0"
 edition = "2021"
 description = "Deterministic authorization for AI agent tool calls"
 license = "MIT"

@@ -116,3 +116,14 @@ MCP and 255 without. Callback suites: prior 56/56 plus host-error 8/8. Fresh rea
 Claude tests using the actual installed binary and plugin passed both the
 policy-denial/no-effect and execution-error/exactly-once cases. The installed
 source remains local and uncommitted; no hosted CI or release is claimed.
+
+## Release candidate qualification
+
+Version 3.13.0 merges the PR #15 history and independent installer tests onto
+main's rmcp 2 update. The merged candidate passes 257 Rust tests with and
+without MCP, 56 callback recovery cases, and 8 host-error cases. Both exact
+Claude 2.1.274 and 2.1.280 builds passed isolated synthetic-provider probes
+for installed-plugin execution, disabled state, disable-during-call, policy
+refusal visibility, and shell failure visibility without duplicate execution.
+These release checks extend the earlier 2.1.280-only incident qualification;
+they do not attest the original running sessions or a production provider.

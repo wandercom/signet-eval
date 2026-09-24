@@ -7,10 +7,13 @@ Claude's function API. Removing this directory removes the modern adapter.
 
 The adapter targets the early-access API emitted by Claude Code **2.1.274** and
 **2.1.280** with `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. The installer accepts those
-exact builds, not a version range. The recovery adapter was verified on 2.1.280 with the real-host fixture
-(active, disabled, disable-during-call, installed-plugin, and Kindex denial paths)
-and 56 independent callback recovery checks. The earlier adapter was qualified on
-2.1.274; this repair retains that installer compatibility without a new 2.1.274 host run. The adapter/binary pairing revision is `claude-functions-2.1.280-v1`;
+exact builds, not a version range. The 3.13.0 recovery adapter passed real-host
+fixtures on both builds with isolated configuration and a synthetic provider:
+installed-plugin behavior, confirmed disablement, disable-during-call, policy
+refusal detail, and shell error detail with exactly one observable execution.
+The callback contract also passes 56 recovery and 8 host-error checks. These
+probes do not qualify a production model provider. The adapter/binary pairing
+revision is `claude-functions-2.1.280-v1`;
 install the rebuilt binary and its embedded adapter together.
 The flag also works through `settings.json`'s `env` object in an isolated
 2.1.274 probe; no shell-profile change is required for that activation path.

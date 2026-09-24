@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--claude", default="claude")
+parser.add_argument("--binary", type=Path, help="Signet executable (default: repository target/debug/signet-eval)")
 parser.add_argument("--kindex-plugin", type=Path)
 parser.add_argument("--disable-policy", action="store_true")
 parser.add_argument("--disable-before-task", action="store_true")
@@ -34,6 +35,7 @@ args = parser.parse_args()
 if (args.deny_bash or args.bash_error) and (args.kindex_plugin or args.disable_policy or args.disable_before_task or args.deny_task or args.deny_native_secret):
     parser.error("Bash failure probes require active policy and no task fixture")
 repo = Path(__file__).resolve().parents[1]
+binary = (args.binary or repo / "target/debug/signet-eval").resolve()
 root = Path(tempfile.mkdtemp(prefix="signet-function-host.")).resolve()
 project = root / "project"
 project.mkdir()
@@ -125,7 +127,7 @@ server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 env = {key: os.environ[key] for key in ("PATH", "USER", "SHELL", "TMPDIR") if key in os.environ}
 env.update({"HOME": str(root / "home"), "SIGNET_DIR": str(root / "home/.signet"),
-            "PATH": str(repo / "target/debug") + os.pathsep + env.get("PATH", ""),
+            "PATH": str(binary.parent) + os.pathsep + env.get("PATH", ""),
             "CLAUDE_CONFIG_DIR": str(root / "claude"), "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1",
             "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             "ANTHROPIC_API_KEY": "synthetic-local-only", "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{server.server_port}",
@@ -136,9 +138,9 @@ if args.kindex_plugin:
     env["PYTHONPATH"] = str(args.kindex_plugin.resolve().parents[1])
 if args.reverse_order:
     plugins.reverse()
-settings = {"pluginConfigs": {"signet-eval-functions": {"options": {"enabled": True, "executable": str(repo / "target/debug/signet-eval")}}}}
+settings = {"pluginConfigs": {"signet-eval-functions": {"options": {"enabled": True, "executable": str(binary)}}}}
 if args.installed_plugin:
-    installed = subprocess.run([str(repo / "target/debug/signet-eval"), "integration", "install-modern"], env=env, capture_output=True, text=True, check=True)
+    installed = subprocess.run([str(binary), "integration", "install-modern"], env=env, capture_output=True, text=True, check=True)
     (root / "install-result.json").write_text(installed.stdout)
     env.pop("CLAUDE_CODE_ENABLE_FUNCTION_HOOKS")
 if args.flag_via_settings:
