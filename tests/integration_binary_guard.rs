@@ -187,6 +187,8 @@ fn wrapped_control_invocations_reach_binary_protection() {
         "nohup signet-eval disable",
         "nohup -- signet-eval reset-session",
         "timeout 10s signet-eval disable",
+        "timeout .5s signet-eval disable",
+        "timeout 1. signet-eval disable",
         "timeout --signal=TERM -k 1s 10s signet-eval pause",
         "timeout -s TERM -k 1s 10s signet-eval reset-session",
         "timeout --foreground 10s signet-eval disable",

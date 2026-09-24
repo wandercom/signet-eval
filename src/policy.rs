@@ -1626,9 +1626,10 @@ fn protected_binary_reference(call: &ToolCall) -> bool {
         let wrapper_path = r"(?:(?:/usr)?/bin/)?";
         let wrapper_options = r"(?:[ \t]+(?:-[^\s;&|<>]+(?:[ \t]+[^\s;&|<>-]+)?|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+))*";
         // These ordinary wrappers retain the following command's identity.
-        // timeout additionally consumes its required literal duration argument.
+        // timeout consumes one literal duration token without validating its numeric
+        // grammar: an invalid duration may conservatively deny, never authorize.
         // This bounded vocabulary is not arbitrary executable/data-flow analysis.
-        let prefixes = format!(r"(?:(?:{wrapper_path}(?:env|command|exec|sudo|nice|nohup|setsid|stdbuf|ionice|time){wrapper_options}|{wrapper_path}timeout{wrapper_options}[ \t]+[0-9]+(?:\.[0-9]+)?[smhd]?|{wrapper_path}(?:sh|bash|zsh|dash|ksh)[ \t]+-(?:c|lc|ec))[ \t]+)*");
+        let prefixes = format!(r"(?:(?:{wrapper_path}(?:env|command|exec|sudo|nice|nohup|setsid|stdbuf|ionice|time){wrapper_options}|{wrapper_path}timeout{wrapper_options}[ \t]+[^\s\x22\x27;&|<>\x28\x29]+|{wrapper_path}(?:sh|bash|zsh|dash|ksh)[ \t]+-(?:c|lc|ec))[ \t]+)*");
         let slot = r"(?:^|[;&|\n\r\x28])[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+[ \t]+)*";
         let executable = format!(r"(?:[^\s\x22\x27;&|<>]*[\\/])?{shell_name}");
         let invocation = format!(r"{slot}{prefixes}{executable}{token_end}");
