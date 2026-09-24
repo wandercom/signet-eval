@@ -1597,6 +1597,17 @@ fn protected_binary_reference(call: &ToolCall) -> bool {
         let installed = format!(
             r"(?:{sep}opt{sep}homebrew{sep}bin{sep}{name}|{sep}usr{sep}local{sep}bin{sep}{name}|(?:~|\$HOME|\$\{{HOME\}}|%USERPROFILE%|(?:[A-Za-z]:)?[\\/][^\s\x22\x27;&|<>]*?){sep}\.cargo{sep}bin{sep}{name})"
         );
+        // Protect this process's actual executable too, including custom install
+        // directories. Resolve once per process, without reading caller-supplied
+        // environment variables or changing serialized policy/fingerprint data.
+        let running_path = std::env::current_exe().ok()?;
+        let running_path = running_path.to_str()?;
+        let running_pattern = running_path
+            .split(['/', '\\'])
+            .map(regex::escape)
+            .collect::<Vec<_>>()
+            .join(sep);
+        let installed = format!(r"(?:{installed}|{running_pattern})");
         // Harmless shell quotes/escapes in an executable basename still name it.
         // Never strip backslashes globally: they can be Windows path separators.
         let shell_word = |word: &str| {
@@ -1612,7 +1623,13 @@ fn protected_binary_reference(call: &ToolCall) -> bool {
         let installed_command = installed.replace(name, &shell_name);
         let installed_reference = format!(r"(?:^|[\s\x22\x27=<>;&|]){installed_command}{token_end}");
         // Ordinary wrapper options/assignments only; no shell execution/parsing.
-        let prefixes = r"(?:(?:(?:env|command|exec|sudo)(?:[ \t]+(?:-[^\s;&|<>]+(?:[ \t]+[^\s;&|<>-]+)?|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+))*|(?:(?:/usr)?/bin/)?(?:sh|bash|zsh|dash|ksh)[ \t]+-(?:c|lc|ec))[ \t]+)*";
+        let wrapper_path = r"(?:(?:/usr)?/bin/)?";
+        let wrapper_options = r"(?:[ \t]+(?:-[^\s;&|<>]+(?:[ \t]+[^\s;&|<>-]+)?|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+))*";
+        // These ordinary wrappers retain the following command's identity.
+        // timeout consumes one literal duration token without validating its numeric
+        // grammar: an invalid duration may conservatively deny, never authorize.
+        // This bounded vocabulary is not arbitrary executable/data-flow analysis.
+        let prefixes = format!(r"(?:(?:{wrapper_path}(?:env|command|exec|sudo|nice|nohup|setsid|stdbuf|ionice|time){wrapper_options}|{wrapper_path}timeout{wrapper_options}[ \t]+[^\s\x22\x27;&|<>\x28\x29]+|{wrapper_path}(?:sh|bash|zsh|dash|ksh)[ \t]+-(?:c|lc|ec))[ \t]+)*");
         let slot = r"(?:^|[;&|\n\r\x28])[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+[ \t]+)*";
         let executable = format!(r"(?:[^\s\x22\x27;&|<>]*[\\/])?{shell_name}");
         let invocation = format!(r"{slot}{prefixes}{executable}{token_end}");

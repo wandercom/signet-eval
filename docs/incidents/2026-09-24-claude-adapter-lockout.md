@@ -127,3 +127,17 @@ for installed-plugin execution, disabled state, disable-during-call, policy
 refusal visibility, and shell failure visibility without duplicate execution.
 These release checks extend the earlier 2.1.280-only incident qualification;
 they do not attest the original running sessions or a production provider.
+
+## Release review correction
+
+After PR #19 merged and before any release tag or registry publication, Adapt
+identified two gaps in the narrowed binary guard: ordinary execution wrappers
+and custom installation paths. The release was held. The follow-up protects
+the running process executable path, including renamed installations, and
+recognizes a bounded set of ordinary wrappers. Separate regression tests cover
+these cases while keeping source repository references outside this rule.
+
+The independent follow-up guard suite fails the old candidate in both new cases
+(4/6 pass) and passes the corrected candidate (6/6). Custom-owner checks copy
+the executable into a directory containing spaces and repeat them with a
+renamed executable; all command inputs are evaluated as policy data only.
