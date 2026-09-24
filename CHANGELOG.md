@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- Restored MCP proxy and management server builds with rmcp 2 by using its renamed text-content constructor.
 - The optional Claude function adapter loads again. Claude Code 2.1.274 names settings-hook events under `classic.` and refuses a hooks module that registers the bare `PreToolUse` event, so on that build the whole module failed to load. Because `install-modern` retires the legacy command hooks, Claude sessions then ran with no Signet enforcement at all. The adapter now registers `classic.PreToolUse`, which keeps the same input envelope and `allow` / `ask` / `deny` result.
 
 ### Changed
