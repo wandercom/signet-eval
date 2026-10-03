@@ -1865,7 +1865,7 @@ pub fn system_default_rules() -> Vec<PolicyRule> {
             // Match `rm` as a discrete token via word boundaries. The previous
             // `contains(parameters, 'rm ')` was an unanchored substring match
             // that false-positived on `swarm `, `firmware `, `transform `, `arm `,
-            // and any path containing "rm " (e.g. `ls ~/Code/drone_swarm`).
+            // and any path containing "rm " (e.g. `ls /Users/example/Code/drone_swarm`).
             name: "block_rm".into(),
             tool_pattern: "^Bash$".into(),
             conditions: vec![r"matches(parameters, '\brm\b')".into()],
@@ -3275,10 +3275,10 @@ mod goodhart_tests {
         // The original block_rm rule used `contains(parameters, 'rm ')` which produced
         // false positives on every word containing "rm " — e.g. `swarm `, `firmware `,
         // `transform `, `arm `, `farm `, `warm `, `harmless `, `germ `. Real bug
-        // discovered when `ls ~/Code/drone_swarm` was denied as a "file deletion".
+        // discovered when `ls /Users/example/Code/drone_swarm` was denied as a "file deletion".
         let policy = default_policy();
         for cmd in &[
-            "ls /Users/jmcentire/Code/drone_swarm",
+            "ls /Users/example/Code/drone_swarm",
             "find ./drone_swarm -name '*.py'",
             "echo transform applied",
             "cat firmware/README.md",
