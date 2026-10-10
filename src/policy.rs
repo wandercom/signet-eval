@@ -221,6 +221,129 @@ pub struct CompiledPolicy {
     pub has_inject_rules: bool,
 }
 
+impl CompiledPolicy {
+    /// True when `field` could change the outcome for `call`: some reachable
+    /// rule names `field` and every condition of that rule the gate can settle
+    /// already holds. Authorization is first-match-wins, so rules after
+    /// one that matches regardless of `field` are unreachable; INJECT rules
+    /// run in their own pass and are always reachable. With `locked_only`,
+    /// as under a pause, only locked rules count and INJECT is not consulted.
+    /// Lets hook mode skip costly parameter enrichment that could not change
+    /// the outcome.
+    pub fn needs_param(
+        &self,
+        field: &str,
+        call: &ToolCall,
+        vault: Option<&Vault>,
+        locked_only: bool,
+    ) -> bool {
+        for rule in &self.rules {
+            if rule.action == Decision::Inject || !auth_rule_applies(rule, call) {
+                continue;
+            }
+            if (rule.locked || !locked_only)
+                && conditions_need_param(&rule.conditions, field, call, vault)
+            {
+                return true;
+            }
+            let undecided = rule
+                .conditions
+                .iter()
+                .any(|cond| undecided_at_gate(cond, field));
+            if !undecided && conditions_hold(&rule.conditions, call, vault) {
+                break;
+            }
+        }
+        !locked_only
+            && self.rules.iter().any(|rule| {
+                rule.action == Decision::Inject
+                    && rule.tool_regex.is_match(&call.tool_name)
+                    && conditions_need_param(&rule.conditions, field, call, vault)
+            })
+    }
+}
+
+/// Whether the authorization pass considers `rule` for `call` at all.
+fn auth_rule_applies(rule: &CompiledRule, call: &ToolCall) -> bool {
+    // These native tools cannot edit settings. Do not classify shell text:
+    // a Bash command that reads a file can still write later in the same call.
+    rule.tool_regex.is_match(&call.tool_name)
+        && !(rule.locked
+            && rule.name == "protect_hook_config"
+            && matches!(call.tool_name.as_str(), "Read" | "Grep" | "Glob"))
+}
+
+fn conditions_hold(conditions: &[String], call: &ToolCall, vault: Option<&Vault>) -> bool {
+    conditions
+        .iter()
+        .all(|cond| matches!(evaluate_condition(cond, call, vault), Ok(true)))
+}
+
+/// True when `conditions` name `field` and every one the gate can settle
+/// already holds for `call`. Conditions are AND'd, so a rule failing
+/// elsewhere cannot match whatever `field` turns out to be.
+pub(crate) fn conditions_need_param(
+    conditions: &[String],
+    field: &str,
+    call: &ToolCall,
+    vault: Option<&Vault>,
+) -> bool {
+    conditions.iter().any(|cond| cond.contains(field))
+        && conditions
+            .iter()
+            .filter(|cond| !undecided_at_gate(cond, field))
+            .all(|cond| matches!(evaluate_condition(cond, call, vault), Ok(true)))
+}
+
+/// Conditions that read only named call inputs or process state, never the
+/// serialized parameters or the vault. Vault readers (`spend_gt`,
+/// `spend_plus_amount_gt`, `has_credential`, `has_recent_action`) are left
+/// out: the gate and `evaluate` read the vault separately, and a concurrent
+/// write or a failed read between them must not leave `field` unresolved.
+const STABLE_CONDITIONS: [&str; 7] = [
+    "param_eq",
+    "param_ne",
+    "param_gt",
+    "param_lt",
+    "param_contains",
+    "has_current_session",
+    "protected_binary_reference",
+];
+
+/// True when the gate cannot settle `cond` before `field` is added: it names
+/// `field`, reads the serialized parameters (`contains`, `any_of`,
+/// `contains_word`, `matches(parameters, ...)`, a bare string), or reads
+/// vault state that may change before `evaluate`. Forms not known to be
+/// stable count as undecided.
+fn undecided_at_gate(cond: &str, field: &str) -> bool {
+    let cond = cond.trim();
+    if cond.contains(field) {
+        return true;
+    }
+    if let Some(inner) = strip_fn(cond, "not") {
+        return undecided_at_gate(inner, field);
+    }
+    if let Some(args) = strip_fn(cond, "or") {
+        let separator = if args.contains(" || ") { " || " } else { ", " };
+        let mut remaining = args;
+        while let Some((left, right)) = split_at_top_level(remaining, separator) {
+            if undecided_at_gate(left, field) {
+                return true;
+            }
+            remaining = right;
+        }
+        return undecided_at_gate(remaining, field);
+    }
+    if let Some(args) = strip_fn(cond, "matches") {
+        return args.split(',').next().map(str::trim) == Some("parameters");
+    }
+    !(cond == "true"
+        || cond == "false"
+        || STABLE_CONDITIONS
+            .iter()
+            .any(|name| strip_fn(cond, name).is_some()))
+}
+
 pub struct EvaluationResult {
     pub decision: Decision,
     pub matched_rule: Option<String>,
@@ -517,16 +640,7 @@ pub fn evaluate(
             continue;
         }
 
-        // Check tool name regex
-        if !rule.tool_regex.is_match(&call.tool_name) {
-            continue;
-        }
-        // These native tools cannot edit settings. Do not classify shell text:
-        // a Bash command that reads a file can still write later in the same call.
-        if rule.locked
-            && rule.name == "protect_hook_config"
-            && matches!(call.tool_name.as_str(), "Read" | "Grep" | "Glob")
-        {
+        if !auth_rule_applies(rule, call) {
             continue;
         }
 

@@ -205,7 +205,242 @@ pub(crate) fn parse_tool_call_input(
 ) -> Result<ToolCall, String> {
     let hook_input: HookInput =
         serde_json::from_value(raw_input).map_err(|_| "Malformed hook input".to_string())?;
-    hook_input.into_tool_call(adapter)
+    let mut call = hook_input.into_tool_call(adapter)?;
+
+    // The host envelope is authoritative for model identity. Drop any lookalike
+    // field from tool input so the agent cannot spoof the model a rule sees.
+    if let Value::Object(parameters) = &mut call.parameters {
+        parameters.remove(AGENT_MODEL_FIELD);
+    }
+    Ok(call)
+}
+
+/// Parameter field exposing the active model to policy conditions,
+/// e.g. `not(matches(agent_model, '^claude-opus-'))`.
+pub(crate) const AGENT_MODEL_FIELD: &str = "agent_model";
+
+/// Bytes read from the end of a transcript when looking for the active model.
+const TRANSCRIPT_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// Claude Code appends the assistant entry for a tool call to the transcript
+/// shortly after PreToolUse fires (384-1836ms observed on 2.1.288, slowest on
+/// a session's first call), so a lookup keyed on `tool_use_id` polls until the
+/// entry lands or this budget expires.
+const TOOL_USE_WAIT: Duration = Duration::from_millis(5000);
+const TOOL_USE_POLL: Duration = Duration::from_millis(25);
+
+/// Attach `agent_model` to a parsed hook call when a rule or an active
+/// preflight constraint could turn on it. Resolution can wait on the host's
+/// transcript, so calls that nothing model-scoped could match skip it. While
+/// `paused`, only locked rules are enforced, so only they count.
+pub(crate) fn attach_agent_model(
+    raw_input: &Value,
+    policy: &CompiledPolicy,
+    vault: Option<&Vault>,
+    paused: bool,
+    call: &mut ToolCall,
+) {
+    let preflight_needs_model = || {
+        vault
+            .and_then(Vault::active_preflight)
+            .is_some_and(|preflight| {
+                !preflight.escalated
+                    && preflight.constraints.iter().any(|constraint| {
+                        regex::Regex::new(&constraint.tool_pattern)
+                            .is_ok_and(|re| re.is_match(&call.tool_name))
+                            && policy::conditions_need_param(
+                                &constraint.conditions,
+                                AGENT_MODEL_FIELD,
+                                call,
+                                vault,
+                            )
+                    })
+            })
+    };
+    if !policy.needs_param(AGENT_MODEL_FIELD, call, vault, paused)
+        && (paused || !preflight_needs_model())
+    {
+        return;
+    }
+    let Some(model) = resolve_agent_model(raw_input) else {
+        return;
+    };
+    if let Value::Object(parameters) = &mut call.parameters {
+        parameters.insert(AGENT_MODEL_FIELD.into(), Value::String(model));
+    }
+}
+
+/// Identify the model that issued this tool call.
+///
+/// 1. An explicit host field: `model` (Claude/Codex style) or `modelName`
+///    (Antigravity), as a string or an object with `id`.
+/// 2. With a `tool_use_id`, the transcript entry that issued that exact call.
+///    Subagent calls (`agent_id`) read the subagent's own transcript. An entry
+///    that never appears yields `None`.
+/// 3. Without a call id, the newest model recorded in the transcript tail.
+fn resolve_agent_model(raw_input: &Value) -> Option<String> {
+    let explicit = ["model", "modelName"]
+        .iter()
+        .find_map(|key| match raw_input.get(*key) {
+            Some(Value::String(model)) => Some(model.as_str()),
+            Some(Value::Object(model)) => model.get("id").and_then(Value::as_str),
+            _ => None,
+        });
+    if let Some(model) = explicit.map(str::trim).filter(|m| !m.is_empty()) {
+        return Some(model.to_owned());
+    }
+
+    let transcript = transcript_for_call(raw_input)?;
+    match string_field(raw_input, "tool_use_id").or_else(|| string_field(raw_input, "toolUseId")) {
+        Some(tool_use_id) => wait_for_tool_use_model(&transcript, &tool_use_id),
+        None => newest_transcript_model(&transcript),
+    }
+}
+
+/// The transcript that records this call: the subagent's own file when the
+/// host names an `agent_id`, otherwise the session transcript.
+fn transcript_for_call(raw_input: &Value) -> Option<std::path::PathBuf> {
+    let transcript = ["transcript_path", "transcriptPath"]
+        .iter()
+        .find_map(|key| string_field(raw_input, key))?;
+    let transcript = std::path::PathBuf::from(transcript);
+
+    let Some(agent_id) = string_field(raw_input, "agent_id") else {
+        return Some(transcript);
+    };
+    let session_id = string_field(raw_input, "session_id")?;
+    let safe = |id: &str| {
+        id.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    };
+    if !safe(&agent_id) || !safe(&session_id) {
+        return None;
+    }
+    Some(
+        transcript
+            .parent()?
+            .join(session_id)
+            .join("subagents")
+            .join(format!("agent-{agent_id}.jsonl")),
+    )
+}
+
+fn read_transcript_tail(path: &std::path::Path) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TRANSCRIPT_TAIL_BYTES);
+    // Read one byte before the window so a line beginning exactly at the
+    // boundary can be told apart from the tail of a longer, cut-off line.
+    let lookback = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(lookback)).ok()?;
+    let mut tail = Vec::new();
+    file.take(len - lookback).read_to_end(&mut tail).ok()?;
+
+    let skip = if start == 0 {
+        0
+    } else {
+        // Drop the lookback byte, plus the partial line when one was cut.
+        tail.iter()
+            .position(|&b| b == b'\n')
+            .map_or(tail.len(), |i| i + 1)
+    };
+    Some(String::from_utf8_lossy(&tail[skip..]).into_owned())
+}
+
+/// A usable model name, rejecting blanks and placeholders such as `<synthetic>`.
+fn usable_model(model: Option<&Value>) -> Option<String> {
+    let model = model?.as_str()?.trim();
+    (!model.is_empty() && !model.starts_with('<')).then(|| model.to_owned())
+}
+
+fn turn_context_model(entry: &Value) -> Option<String> {
+    (entry.get("type")?.as_str()? == "turn_context")
+        .then(|| usable_model(entry.get("payload")?.get("model")))
+        .flatten()
+}
+
+/// Model of the entry that issued `tool_use_id`, scanning in file order so
+/// the genuine entry wins over any later line that repeats the id. Claude Code
+/// records the model on the assistant entry; Codex records it on the
+/// `turn_context` preceding the `function_call`.
+fn tool_use_model(tail: &str, tool_use_id: &str) -> Option<String> {
+    let mut codex_model = None;
+    for line in tail.lines() {
+        // Cheap prefilter only: the parsed top-level `type` decides the kind,
+        // since tool input can carry either string.
+        if !line.contains("\"turn_context\"") && !line.contains(tool_use_id) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match entry.get("type").and_then(Value::as_str) {
+            Some("turn_context") => {
+                if let Some(model) = turn_context_model(&entry) {
+                    codex_model = Some(model);
+                }
+            }
+            Some("assistant") => {
+                let message = entry.get("message");
+                let issued = message
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("tool_use")
+                                && block.get("id").and_then(Value::as_str) == Some(tool_use_id)
+                        })
+                    });
+                if issued {
+                    return usable_model(message.and_then(|m| m.get("model")));
+                }
+            }
+            Some("response_item") => {
+                let payload = entry.get("payload");
+                if payload
+                    .and_then(|p| p.get("call_id"))
+                    .and_then(Value::as_str)
+                    == Some(tool_use_id)
+                {
+                    return codex_model;
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn wait_for_tool_use_model(path: &std::path::Path, tool_use_id: &str) -> Option<String> {
+    let deadline = std::time::Instant::now() + TOOL_USE_WAIT;
+    loop {
+        if let Some(model) = read_transcript_tail(path)
+            .as_deref()
+            .and_then(|tail| tool_use_model(tail, tool_use_id))
+        {
+            return Some(model);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(TOOL_USE_POLL);
+    }
+}
+
+/// Newest model in the transcript tail, for hosts that send no call id.
+/// Understands Claude Code assistant entries and Codex `turn_context` entries.
+fn newest_transcript_model(path: &std::path::Path) -> Option<String> {
+    let tail = read_transcript_tail(path)?;
+    tail.lines().rev().find_map(|line| {
+        let entry: Value = serde_json::from_str(line).ok()?;
+        match entry.get("type")?.as_str()? {
+            "assistant" => usable_model(entry.get("message")?.get("model")),
+            "turn_context" => turn_context_model(&entry),
+            _ => None,
+        }
+    })
 }
 
 fn copy_argument(map: &mut Map<String, Value>, source: &str, target: &str) {
@@ -355,7 +590,7 @@ pub fn run_hook_with_adapter(
             .and_then(|value| value.as_str()),
     );
 
-    let call = match parse_tool_call_input(raw_input, adapter) {
+    let mut call = match parse_tool_call_input(raw_input.clone(), adapter) {
         Ok(call) => call,
         Err(_) => {
             emit_deny(adapter, event, "Malformed hook input");
@@ -365,7 +600,10 @@ pub fn run_hook_with_adapter(
 
     // Check if paused — if so, only enforce locked (self-protection) rules
     // File-based global pause OR session-scoped global pause from pauses.json
-    if crate::vault::is_paused_file() || crate::vault::is_globally_paused_json() {
+    let paused = crate::vault::is_paused_file() || crate::vault::is_globally_paused_json();
+    attach_agent_model(&raw_input, policy, vault, paused, &mut call);
+
+    if paused {
         let result = policy::evaluate(&call, policy, vault);
         if result.decision == Decision::Deny && result.matched_locked {
             // Self-protection: locked deny always enforced during pause
@@ -933,5 +1171,544 @@ mod tests {
         assert_eq!(call.parameters["mcp_server_name"], "danger");
         assert_eq!(call.parameters["mcp_tool_name"], "delete");
         assert!(call.parameters.get("Arguments").is_none());
+    }
+
+    const MODEL_GATE_POLICY: &str = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: cloud_tools_require_opus
+    tool_pattern: "^Bash$"
+    conditions:
+      - "matches(command, '(^|[;&|(\\s])(gcloud|cloud-sql-proxy)(\\s|$)')"
+      - "not(matches(agent_model, '^claude-opus-'))"
+    action: DENY
+    reason: "gcloud/cloud-sql-proxy restricted to Opus"
+"#;
+
+    fn model_gate_policy() -> CompiledPolicy {
+        CompiledPolicy::from_config(&serde_yaml::from_str(MODEL_GATE_POLICY).unwrap())
+    }
+
+    /// Parse and enrich exactly as hook mode does under a policy that reads agent_model.
+    fn parse_with_model(input: Value, adapter: HookAdapter) -> ToolCall {
+        let mut call = parse_tool_call_input(input.clone(), adapter).unwrap();
+        attach_agent_model(&input, &model_gate_policy(), None, false, &mut call);
+        call
+    }
+
+    fn claude_model(input: Value) -> Option<String> {
+        parse_with_model(input, HookAdapter::Claude).parameters["agent_model"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    fn write_lines(path: &std::path::Path, lines: &[Value]) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    fn assistant(model: &str, tool_use_id: Option<&str>) -> Value {
+        let content = match tool_use_id {
+            Some(id) => serde_json::json!([{"type": "tool_use", "id": id, "name": "Bash"}]),
+            None => serde_json::json!([{"type": "text", "text": "hi"}]),
+        };
+        serde_json::json!({"type": "assistant", "message": {"model": model, "content": content}})
+    }
+
+    #[test]
+    fn agent_model_prefers_explicit_envelope_field() {
+        let model = claude_model(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud auth list"},
+            "model": {"id": "claude-sonnet-5-5", "display_name": "Sonnet"}
+        }));
+        assert_eq!(model.as_deref(), Some("claude-sonnet-5-5"));
+
+        // Antigravity's live payload carries the model as camel-case modelName.
+        let call = parse_with_model(
+            serde_json::json!({
+                "conversationId": "4989a389-5729-4c84-9e4f-44bb9044633a",
+                "modelName": "gemini-pro-agent",
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "gcloud auth list", "Cwd": "/tmp"}}
+            }),
+            HookAdapter::Antigravity,
+        );
+        assert_eq!(call.parameters["agent_model"], "gemini-pro-agent");
+    }
+
+    #[test]
+    fn agent_model_binds_to_the_entry_that_issued_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        write_lines(
+            &transcript,
+            &[
+                assistant("claude-opus-5-5", None),
+                assistant("claude-haiku-4-5-20251001", Some("toolu_real")),
+                // A line planted after the genuine entry cannot override it.
+                assistant("claude-opus-5-5", Some("toolu_real")),
+                assistant("claude-opus-5-5", None),
+            ],
+        );
+        let model = claude_model(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud auth list"},
+            "transcript_path": transcript,
+            "tool_use_id": "toolu_real"
+        }));
+        assert_eq!(model.as_deref(), Some("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn agent_model_reads_an_issuing_entry_whose_input_mentions_turn_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        write_lines(
+            &transcript,
+            &[serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": "claude-opus-5-5",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_ctx",
+                        "name": "Bash",
+                        "input": {"command": "gcloud auth list", "turn_context": {}}
+                    }]
+                }
+            })],
+        );
+        let model = claude_model(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud auth list"},
+            "transcript_path": transcript,
+            "tool_use_id": "toolu_ctx"
+        }));
+        assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
+    }
+
+    #[test]
+    fn agent_model_waits_for_a_late_transcript_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        write_lines(&transcript, &[assistant("claude-opus-5-5", None)]);
+        let writer = {
+            let transcript = transcript.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                write_lines(
+                    &transcript,
+                    &[assistant("claude-sonnet-5-5", Some("toolu_late"))],
+                );
+            })
+        };
+        let model = claude_model(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud auth list"},
+            "transcript_path": transcript,
+            "tool_use_id": "toolu_late"
+        }));
+        writer.join().unwrap();
+        assert_eq!(model.as_deref(), Some("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn agent_model_absent_when_issuing_entry_never_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        write_lines(&transcript, &[assistant("claude-opus-5-5", None)]);
+        let model = claude_model(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud auth list"},
+            "transcript_path": transcript,
+            "tool_use_id": "toolu_missing"
+        }));
+        assert_eq!(model, None);
+    }
+
+    #[test]
+    fn agent_model_reads_the_subagent_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("sess-1.jsonl");
+        write_lines(
+            &transcript,
+            &[assistant("claude-opus-5-5", Some("toolu_sub"))],
+        );
+        let subagents = dir.path().join("sess-1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        write_lines(
+            &subagents.join("agent-a28131507e0931abb.jsonl"),
+            &[assistant("claude-haiku-4-5-20251001", Some("toolu_sub"))],
+        );
+        let input = |agent_id: &str| {
+            serde_json::json!({
+                "session_id": "sess-1",
+                "agent_id": agent_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": "gcloud auth list"},
+                "transcript_path": transcript,
+                "tool_use_id": "toolu_sub"
+            })
+        };
+        assert_eq!(
+            claude_model(input("a28131507e0931abb")).as_deref(),
+            Some("claude-haiku-4-5-20251001")
+        );
+        assert_eq!(claude_model(input("../../sess-1")), None);
+    }
+
+    #[test]
+    fn agent_model_reads_codex_rollouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("rollout.jsonl");
+        write_lines(
+            &transcript,
+            &[
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-5.5-codex"}}),
+                serde_json::json!({"type": "response_item", "payload": {"type": "function_call", "call_id": "call_1"}}),
+                serde_json::json!({"type": "turn_context", "payload": {"model": "gpt-5.5-mini"}}),
+            ],
+        );
+        let input = |call_id: Option<&str>| {
+            let mut input = serde_json::json!({
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "gcloud auth list"},
+                "transcript_path": transcript
+            });
+            if let Some(id) = call_id {
+                input["tool_use_id"] = Value::String(id.into());
+            }
+            parse_with_model(input, HookAdapter::Codex)
+        };
+        assert_eq!(
+            input(Some("call_1")).parameters["agent_model"],
+            "gpt-5.5-codex"
+        );
+        assert_eq!(input(None).parameters["agent_model"], "gpt-5.5-mini");
+    }
+
+    #[test]
+    fn agent_model_newest_fallback_skips_placeholders_and_partial_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        let filler = "x".repeat(TRANSCRIPT_TAIL_BYTES as usize);
+        write_lines(
+            &transcript,
+            &[
+                serde_json::json!({"type": "assistant", "message": {"model": "claude-opus-5-5"}, "pad": filler}),
+                assistant("claude-sonnet-5-5", None),
+                assistant("<synthetic>", None),
+            ],
+        );
+        let model = claude_model(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud auth list"},
+            "transcript_path": transcript
+        }));
+        assert_eq!(model.as_deref(), Some("claude-sonnet-5-5"));
+    }
+
+    #[test]
+    fn transcript_tail_keeps_a_line_starting_exactly_at_the_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let last = assistant("claude-sonnet-5-5", None).to_string();
+        let window = TRANSCRIPT_TAIL_BYTES as usize;
+
+        // The window begins exactly at the start of `last`: it holds `last`
+        // plus a filler line, preceded by an earlier complete line.
+        let filler = format!("{}\n", "#".repeat(window - last.len() - 2));
+        std::fs::write(&path, format!("{{}}\n{last}\n{filler}")).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len() - TRANSCRIPT_TAIL_BYTES,
+            3
+        );
+        let tail = read_transcript_tail(&path).unwrap();
+        assert!(tail.lines().any(|line| line == last));
+
+        // The window begins one byte into a line: that fragment is dropped.
+        std::fs::write(&path, format!("{}\n{last}\n", "#".repeat(window + 1))).unwrap();
+        let tail = read_transcript_tail(&path).unwrap();
+        assert!(!tail.contains('#'));
+        assert!(tail.lines().any(|line| line == last));
+    }
+
+    #[test]
+    fn agent_model_cannot_be_spoofed_through_tool_input() {
+        let spoofed = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud sql connect", "agent_model": "claude-opus-5-5"}
+        });
+        assert_eq!(claude_model(spoofed.clone()), None);
+        let call = parse_tool_call_input(spoofed, HookAdapter::Claude).unwrap();
+        assert!(call.parameters.get("agent_model").is_none());
+    }
+
+    #[test]
+    fn agent_model_is_only_resolved_when_a_rule_could_match() {
+        let attached = |command: &str, policy: &CompiledPolicy| {
+            let input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "model": "claude-opus-5-5"
+            });
+            let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+            attach_agent_model(&input, policy, None, false, &mut call);
+            call.parameters.get("agent_model").is_some()
+        };
+        assert!(attached("gcloud auth list", &model_gate_policy()));
+        assert!(!attached("ls", &model_gate_policy()));
+        assert!(!attached("gcloud auth list", &policy::default_policy()));
+    }
+
+    fn policy_from_yaml(yaml: &str) -> CompiledPolicy {
+        CompiledPolicy::from_config(&serde_yaml::from_str(yaml).unwrap())
+    }
+
+    /// Hook-mode decision for a Bash call issued by `model`.
+    fn decide_with_model(
+        policy: &CompiledPolicy,
+        vault: Option<&Vault>,
+        command: &str,
+        model: &str,
+    ) -> Decision {
+        let input = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "model": model
+        });
+        let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+        attach_agent_model(&input, policy, vault, false, &mut call);
+        policy::evaluate(&call, policy, vault).decision
+    }
+
+    #[test]
+    fn agent_model_is_not_resolved_for_rules_shadowed_by_an_earlier_match() {
+        let attached = |policy: &CompiledPolicy, command: &str| {
+            let input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "model": "claude-opus-5-5"
+            });
+            let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+            attach_agent_model(&input, policy, None, false, &mut call);
+            call.parameters.get("agent_model").is_some()
+        };
+        let policy = |model_rule_action: &str| {
+            policy_from_yaml(&format!(
+                r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: allow_gcloud_auth
+    tool_pattern: "^Bash$"
+    conditions:
+      - "matches(command, '^gcloud auth ')"
+    action: ALLOW
+  - name: model_rule
+    tool_pattern: "^Bash$"
+    conditions:
+      - "matches(command, '^gcloud ')"
+      - "not(matches(agent_model, '^claude-opus-'))"
+    action: {model_rule_action}
+    inject:
+      trigger: {{mode: constant, peak: 1.0}}
+      payload: {{text: "use opus"}}
+"#
+            ))
+        };
+        // First match wins, so the earlier ALLOW decides `gcloud auth`.
+        assert!(!attached(&policy("DENY"), "gcloud auth list"));
+        assert!(attached(&policy("DENY"), "gcloud sql connect"));
+        // INJECT rules run in their own pass and stay reachable.
+        assert!(attached(&policy("INJECT"), "gcloud auth list"));
+    }
+
+    #[test]
+    fn agent_model_is_only_resolved_for_locked_rules_while_paused() {
+        let policy = |locked: bool| {
+            policy_from_yaml(&format!(
+                r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: gcloud_requires_opus
+    tool_pattern: "^Bash$"
+    conditions:
+      - "matches(command, '^gcloud ')"
+      - "not(matches(agent_model, '^claude-opus-'))"
+    action: DENY
+    locked: {locked}
+"#
+            ))
+        };
+        let attached = |policy: &CompiledPolicy, paused: bool| {
+            let input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "gcloud auth list"},
+                "model": "claude-opus-5-5"
+            });
+            let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+            attach_agent_model(&input, policy, None, paused, &mut call);
+            call.parameters.get("agent_model").is_some()
+        };
+        assert!(attached(&policy(false), false));
+        // A pause enforces only locked rules, so nothing else is worth the wait.
+        assert!(!attached(&policy(false), true));
+        assert!(attached(&policy(true), true));
+    }
+
+    #[test]
+    fn agent_model_gating_treats_vault_state_as_undecided() {
+        crate::vault::set_test_session_id(Some("vault-state-gate"));
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::vault::derive_master_key("testpass", &[0u8; 16]);
+        let vault = Vault::new(key, dir.path().join("state.db"));
+        let policy = policy_from_yaml(
+            r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: no_haiku_after_plan
+    tool_pattern: "^Bash$"
+    conditions:
+      - "has_recent_action('EnterPlanMode', 5)"
+      - "matches(agent_model, '^claude-haiku-')"
+    action: DENY
+"#,
+        );
+        let input = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "ls"},
+            "model": "claude-haiku-4-5-20251001"
+        });
+        let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+        attach_agent_model(&input, &policy, Some(&vault), false, &mut call);
+        // The ledger changes between gating and evaluation, as a concurrent
+        // hook or a transient read failure would make it.
+        vault.log_action("EnterPlanMode", "allow", "", 0.0, "{}");
+        let decision = policy::evaluate(&call, &policy, Some(&vault)).decision;
+        crate::vault::clear_test_session_id();
+        assert_eq!(decision, Decision::Deny);
+    }
+
+    #[test]
+    fn agent_model_is_resolved_for_active_preflight_constraints() {
+        crate::vault::set_test_session_id(None);
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::vault::derive_master_key("testpass", &[0u8; 16]);
+        let vault = Vault::new(key, dir.path().join("state.db"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        vault
+            .store_preflight(&Preflight {
+                id: "opus-only".into(),
+                task: "cloud work".into(),
+                risks: vec![],
+                constraints: vec![SoftConstraint {
+                    name: "gcloud_requires_opus".into(),
+                    tool_pattern: "^Bash$".into(),
+                    conditions: vec![
+                        "matches(command, '^gcloud ')".into(),
+                        "not(matches(agent_model, '^claude-opus-'))".into(),
+                    ],
+                    action: "DENY".into(),
+                    reason: "gcloud is Opus-only".into(),
+                    alternative: "hand off to Opus".into(),
+                }],
+                submitted_at: now,
+                lockout_until: now + 3600,
+                violation_count: 0,
+                escalated: false,
+                session_id: None,
+            })
+            .unwrap();
+        let preflight = vault.active_preflight().unwrap();
+
+        // The hard policy never names agent_model; only the constraint does.
+        let policy = policy::default_policy();
+        let violates = |model: &str| {
+            let input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "gcloud sql connect"},
+                "model": model
+            });
+            let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+            attach_agent_model(&input, &policy, Some(&vault), false, &mut call);
+            evaluate_preflight_constraint(&call, &preflight, &vault).is_some()
+        };
+        assert!(!violates("claude-opus-5-5"));
+        assert!(violates("claude-haiku-4-5-20251001"));
+        crate::vault::clear_test_session_id();
+    }
+
+    #[test]
+    fn agent_model_is_resolved_for_conditions_reading_all_parameters() {
+        for reader in [
+            "matches(parameters, 'claude-opus-')",
+            "contains(parameters, 'claude-opus-')",
+            "any_of(parameters, 'claude-opus-', 'gpt-5')",
+            "contains_word(parameters, 'claude-opus-5-5')",
+            "'claude-opus-'",
+            "not(not(contains(parameters, 'claude-opus-')))",
+            "or(false, contains(parameters, 'claude-opus-'))",
+        ] {
+            let policy = policy_from_yaml(&format!(
+                r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: opus_reader
+    tool_pattern: "^Bash$"
+    conditions:
+      - "{reader}"
+      - "matches(agent_model, '.')"
+    action: DENY
+"#
+            ));
+            assert_eq!(
+                decide_with_model(&policy, None, "ls", "claude-opus-5-5"),
+                Decision::Deny,
+                "{reader}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_model_gates_cloud_tools_and_fails_closed_when_unknown() {
+        let compiled = model_gate_policy();
+        let decide = |command: &str, model: Option<&str>| {
+            let mut input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command}
+            });
+            if let Some(model) = model {
+                input["model"] = Value::String(model.into());
+            }
+            let call = parse_with_model(input, HookAdapter::Claude);
+            policy::evaluate(&call, &compiled, None).decision
+        };
+        let gcloud = "gcloud sql instances list";
+        assert_eq!(decide(gcloud, Some("claude-opus-5-5")), Decision::Allow);
+        assert_eq!(
+            decide(gcloud, Some("claude-haiku-4-5-20251001")),
+            Decision::Deny
+        );
+        assert_eq!(decide(gcloud, None), Decision::Deny);
+        assert_eq!(
+            decide("ls", Some("claude-haiku-4-5-20251001")),
+            Decision::Allow
+        );
     }
 }

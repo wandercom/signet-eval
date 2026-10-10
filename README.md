@@ -226,6 +226,52 @@ and `{matched_param.X}`. See `examples/inject_examples.yaml`.
 | `has_current_session()` | Hook host supplied a distinct chat/session identifier | `has_current_session()` |
 | `true` / `false` | Literal | `true` |
 
+### Model-scoped rules
+
+Hook-mode calls can carry an `agent_model` field naming the model that issued
+the tool call. Signet resolves it in this order:
+
+1. An explicit host field: `model` (string, or object with `id`) or
+   Antigravity's `modelName`.
+2. The transcript entry that issued this exact call, matched by `tool_use_id`.
+   Claude Code's PreToolUse input has no model field, and it appends the
+   issuing entry 0.4–2s after the hook fires, so Signet polls for up to 5s.
+   Subagent calls (`agent_id`) read the subagent's own transcript, so a Haiku
+   subagent under an Opus session is seen as Haiku. Codex rollouts resolve
+   through the `turn_context` preceding the matching `function_call`.
+3. With no call id, the newest model in the last 1 MiB of the transcript.
+
+Resolution only happens for calls that a rule or active preflight constraint
+naming `agent_model` could match: its tool pattern and its other conditions
+must already hold. Conditions that read the whole parameter set, such as
+`contains(parameters, ...)`, see `agent_model` too, so they are left
+undecided. So are vault readers such as `has_recent_action`, since the
+vault can change between this check and the decision. A rule behind an earlier rule that already matches is skipped,
+since authorization is first-match-wins; INJECT rules always count.
+While enforcement is paused, only locked rules count. Other
+calls pay nothing. Any `agent_model` in the tool input itself is
+discarded, so the agent cannot claim a different model.
+
+When no model can be determined the field is absent and compares as an empty
+string. Write the condition as a negated allowlist so unknown models fail
+closed:
+
+```yaml
+- name: cloud_tools_require_opus
+  tool_pattern: "^Bash$"
+  conditions:
+    - "matches(command, '(^|[;&|(\\s])(gcloud|cloud-sql-proxy)(\\s|$)')"
+    - "not(matches(agent_model, '^claude-(opus|fable)-'))"
+  action: DENY
+  locked: true
+  reason: "gcloud and cloud-sql-proxy are limited to Opus and Fable"
+```
+
+Command matching stays substring-based, so an agent determined to reach the
+same binary through an interpreter or wrapper script can still evade it. An
+agent that can write its own transcript can also plant entries, so pair
+model-scoped rules with a rule that denies writes under `~/.claude/projects/`.
+
 ## Encrypted Vault
 
 Three-tier encrypted storage with passphrase-derived key hierarchy (Argon2id + AES-256-GCM):
