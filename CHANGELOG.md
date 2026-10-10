@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Changed
+- An ENSURE rule whose check script is missing or cannot be resolved now denies with a reason naming the check. Before, an unlocked rule allowed the call silently, which was only safe while the binary installed its own identity check. Copy `~/.signet/checks/` along with any `rules.yaml` that refers to it. A check that cannot run for any other reason (not executable, timed out, input too large) also names the check, even when the rule sets a custom `message`.
+- ENSURE scripts get `SIGNET_TOOL_CWD_SOURCE` (`tool_input`, `host` or `process`) and `SIGNET_HOST_CWD` next to `SIGNET_TOOL_CWD`, so a check can tell a model-supplied directory from the host's. An empty tool `cwd` no longer hides the host value.
+- The MCP `signet_edit_rule`, `signet_reorder_rule` and `signet_remove_rule` tools act on a user rule whose name matches an unlocked system rule. That user rule is the one evaluated. Before, the tools refused it as a system rule.
+
+### Fixed
+- Retired binary-owned identity rules are excluded consistently from effective CLI and MCP policy views. `validate` and `signet_validate` report a retired entry left in `policy.yaml` as an ignored rule to move into `rules.yaml`. User-authored rules and check files remain untouched.
+- User-managed ENSURE scripts receive the original command and call working directory as literal `SIGNET_TOOL_COMMAND` and `SIGNET_TOOL_CWD` environment values, alongside normalized stdin. No personal account defaults are installed.
+
+### Removed
+- `github_identity_guard` and its embedded `gh-identity-matches-remote` check. The script hardcoded one developer's personal owner-to-account map, so on any other machine it denied every `git push`/`pull`/`fetch`/`clone` and `gh` call, and deleting the script didn't help because the binary rewrote it on the next matching call. A copy of the rule in an existing `policy.yaml` snapshot is ignored on load. An existing `~/.signet/checks/gh-identity-matches-remote` is left in place; no built-in rule invokes it, but an explicit user-authored ENSURE rule can still do so. Delete it by hand if no longer wanted. Anyone who wants identity enforcement can keep their own script and add an `ENSURE` rule to `rules.yaml`.
+
 ## [3.13.0] - 2026-09-24
 
 ### Added

@@ -24,7 +24,9 @@ components:
       - "Map Gate/Ensure decisions to deny with reason in hook output"
       - "Ensure checks directory protection survives pause mode"
       - "Capture and relay ensure script stderr in deny reason"
-    constraints: [C002, C005, C010]
+      - "Deny with a reason when an ensure script is missing or unresolvable, locked or not"
+      - "Pass command, cwd and cwd provenance to ensure scripts as literal environment values"
+    constraints: [C002, C005, C010, C028, C029]
 
   - name: vault.rs
     description: Encrypted vault, action ledger, credentials
@@ -50,13 +52,6 @@ components:
       - "signet-eval rules: show gate/ensure config"
     constraints: []
 
-  - name: checks/gh-identity-matches-remote
-    description: Shell script - validates GitHub identity matches git remote
-    location: "~/.signet/checks/gh-identity-matches-remote"
-    changes:
-      - "New file: check script for GitHub identity validation"
-    constraints: [C011]
-
 edges:
   - from: hook.rs
     to: policy.rs
@@ -66,7 +61,7 @@ edges:
     relationship: "gate action queries recent_actions_matching()"
   - from: policy.rs
     to: "~/.signet/checks/"
-    relationship: "ensure action spawns scripts from this directory"
+    relationship: "ensure action spawns operator-managed scripts from this directory; the binary installs none"
   - from: mcp_server.rs
     to: policy.rs
     relationship: "CRUD operations on rules with gate/ensure config"

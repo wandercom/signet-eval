@@ -355,6 +355,10 @@ pub fn run_hook_with_adapter(
             .and_then(|value| value.as_str()),
     );
 
+    let envelope_cwd = raw_input
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     let call = match parse_tool_call_input(raw_input, adapter) {
         Ok(call) => call,
         Err(_) => {
@@ -373,8 +377,8 @@ pub fn run_hook_with_adapter(
             return 0;
         }
         if result.decision == Decision::Ensure && result.matched_locked {
-            // Self-protection: locked ensure (e.g., identity guard) enforced during pause
-            let resolved = resolve_ensure_result(result, &call);
+            // Self-protection: locked ensure enforced during pause
+            let resolved = resolve_ensure_result_with_cwd(result, &call, envelope_cwd.as_deref());
             if resolved.decision == Decision::Deny {
                 emit_decision(adapter, event, "deny", resolved.reason, None);
                 return 0;
@@ -390,7 +394,7 @@ pub fn run_hook_with_adapter(
 
     // Resolve Ensure: run check script, convert to Allow/Deny
     let result = if result.decision == Decision::Ensure {
-        resolve_ensure_result(result, &call)
+        resolve_ensure_result_with_cwd(result, &call, envelope_cwd.as_deref())
     } else {
         result
     };
@@ -729,35 +733,32 @@ fn emit_deny(adapter: HookAdapter, event: HookEvent, reason: &str) {
 }
 
 /// Run an ensure check script and return (passed, stderr_output).
-/// For unlocked rules, missing scripts resolve gracefully (allow).
-/// For locked rules, missing scripts fail closed (deny).
-fn resolve_ensure(config: &EnsureConfig, locked: bool, call: &ToolCall) -> (bool, String) {
-    if let Err(error) = crate::embedded_checks::install_if_builtin(&config.check) {
-        return (false, error);
-    }
+///
+/// A missing or unresolvable check fails closed for every rule. The binary
+/// installs no checks, so an absent script means the operator's rule cannot be
+/// evaluated, which is not the same as the check passing.
+///
+/// Every reason for a check that could not run names the check, because a
+/// rule's custom message replaces the default one that would.
+fn resolve_ensure(
+    config: &EnsureConfig,
+    call: &ToolCall,
+    envelope_cwd: Option<&str>,
+) -> (bool, String) {
+    let could_not_run = |detail: String| {
+        (
+            false,
+            format!("Check '{}' could not run: {detail}", config.check),
+        )
+    };
 
     let script_path = match policy::resolve_ensure_script_path(&config.check) {
         Ok(p) => p,
-        Err(e) => {
-            if locked {
-                return (false, e);
-            } else {
-                // Unlocked ensure: script not installed yet, allow gracefully
-                return (true, String::new());
-            }
-        }
+        Err(e) => return could_not_run(format!("script unavailable: {e}")),
     };
 
     if !script_path.exists() {
-        if locked {
-            return (
-                false,
-                format!("Check script not found: {}", script_path.display()),
-            );
-        } else {
-            // Unlocked ensure: script not installed yet, allow gracefully
-            return (true, String::new());
-        }
+        return could_not_run(format!("script not found: {}", script_path.display()));
     }
 
     let timeout_secs = config.timeout.max(1).min(30) as u64;
@@ -769,34 +770,43 @@ fn resolve_ensure(config: &EnsureConfig, locked: bool, call: &ToolCall) -> (bool
     .to_string();
     const CHECK_INPUT_MAX_BYTES: usize = 32 * 1024;
     if normalized_input.len() > CHECK_INPUT_MAX_BYTES {
-        return (
-            false,
-            format!("Ensure check input exceeds the {CHECK_INPUT_MAX_BYTES}-byte safety limit"),
-        );
+        return could_not_run(format!(
+            "input exceeds the {CHECK_INPUT_MAX_BYTES}-byte safety limit"
+        ));
     }
 
+    // Forward context as literal child environment values, never shell source.
+    let first_non_empty = |keys: &[&str]| {
+        keys.iter()
+            .filter_map(|key| call.parameters.get(*key).and_then(Value::as_str))
+            .find(|value| !value.is_empty())
+    };
+    let tool_command = first_non_empty(&["command", "cmd"]).unwrap_or("");
+    let requested_cwd = first_non_empty(&["cwd", "workdir"]);
+    let host_cwd = envelope_cwd.filter(|cwd| !cwd.is_empty());
+    let (tool_cwd, cwd_source) = match (requested_cwd, host_cwd) {
+        (Some(cwd), _) => (cwd.to_owned(), "tool_input"),
+        (None, Some(cwd)) => (cwd.to_owned(), "host"),
+        (None, None) => (
+            std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            "process",
+        ),
+    };
     let mut command = Command::new(&script_path);
     command
+        .env("SIGNET_TOOL_COMMAND", tool_command)
+        .env("SIGNET_TOOL_CWD", tool_cwd)
+        .env("SIGNET_TOOL_CWD_SOURCE", cwd_source)
+        .env("SIGNET_HOST_CWD", host_cwd.unwrap_or(""))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    if config.check == crate::embedded_checks::GITHUB_IDENTITY_CHECK {
-        if let Some(command_text) = call.parameters.get("command").and_then(|v| v.as_str()) {
-            command.env("SIGNET_TOOL_COMMAND", command_text);
-        }
-        if let Some(call_cwd) = call
-            .parameters
-            .get("workdir")
-            .or_else(|| call.parameters.get("cwd"))
-            .and_then(|v| v.as_str())
-        {
-            command.env("SIGNET_TOOL_CWD", call_cwd);
-        }
-    }
 
     let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => return (false, format!("Failed to spawn check script: {e}")),
+        Err(e) => return could_not_run(format!("failed to spawn script: {e}")),
     };
     if let Some(mut child_stdin) = child.stdin.take() {
         // Some checks do not consume stdin and may exit before this write. Their
@@ -825,19 +835,25 @@ fn resolve_ensure(config: &EnsureConfig, locked: bool, call: &ToolCall) -> (bool
         Ok(None) => {
             let _ = child.kill();
             let _ = child.wait();
-            (
-                false,
-                format!("Check script timed out after {timeout_secs}s"),
-            )
+            could_not_run(format!("script timed out after {timeout_secs}s"))
         }
-        Err(e) => (false, format!("Error waiting for check script: {e}")),
+        Err(e) => could_not_run(format!("error waiting for script: {e}")),
     }
 }
 
 /// Resolve an Ensure evaluation result by running the check script.
 pub(crate) fn resolve_ensure_result(result: EvaluationResult, call: &ToolCall) -> EvaluationResult {
+    resolve_ensure_result_with_cwd(result, call, None)
+}
+
+/// Host cwd is execution context only; it never changes authorization parameters.
+pub(crate) fn resolve_ensure_result_with_cwd(
+    result: EvaluationResult,
+    call: &ToolCall,
+    envelope_cwd: Option<&str>,
+) -> EvaluationResult {
     if let Some(ref ensure_config) = result.ensure_config {
-        let (passed, stderr) = resolve_ensure(ensure_config, result.matched_locked, call);
+        let (passed, stderr) = resolve_ensure(ensure_config, call, envelope_cwd);
         if passed {
             EvaluationResult {
                 decision: Decision::Allow,

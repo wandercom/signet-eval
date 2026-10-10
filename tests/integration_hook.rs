@@ -81,252 +81,6 @@ fn test_hook_asks_force_push() {
     assert_eq!(parse_decision(&out), "ask");
 }
 
-fn run_identity_hook(input: &str) -> (tempfile::TempDir, String, i32) {
-    run_identity_hook_with_env(input, &[])
-}
-
-fn run_identity_hook_with_env(
-    input: &str,
-    extra_env: &[(&str, &str)],
-) -> (tempfile::TempDir, String, i32) {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
-    let shim_dir = home.join(".gh-shim");
-    let fake_bin = dir.path().join("bin");
-    let state_dir = dir.path().join("state");
-    let repository = dir.path().join("repository");
-    std::fs::create_dir_all(&shim_dir).unwrap();
-    std::fs::create_dir_all(&fake_bin).unwrap();
-    std::fs::create_dir(&repository).unwrap();
-    // The identity being verified belongs to this fixture, independent of the
-    // source checkout's owner, local email, and the developer's global config.
-    for args in [
-        vec!["init", "-q"],
-        vec![
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/jmcentire/example.git",
-        ],
-        vec!["config", "user.email", "jandrewmcentire@gmail.com"],
-    ] {
-        assert!(Command::new("git")
-            .args(args)
-            .current_dir(&repository)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .status()
-            .unwrap()
-            .success());
-    }
-
-    let shim = shim_dir.join("gh");
-    std::fs::write(&shim, "#!/bin/sh\nexit 99\n").unwrap();
-    let fake_gh = fake_bin.join("gh");
-    std::fs::write(
-        &fake_gh,
-        r#"#!/bin/sh
-if [ -n "${FAKE_GH_LOG:-}" ]; then
-  printf 'command=%s\n' "${SIGNET_TOOL_COMMAND:-}" >> "$FAKE_GH_LOG"
-  printf 'cwd=%s\n' "${SIGNET_TOOL_CWD:-}" >> "$FAKE_GH_LOG"
-  printf '%s\n' "$*" >> "$FAKE_GH_LOG"
-fi
-if [ "$1 $2 $3 $4" = "auth token --user jmcentire" ]; then
-  printf 'token-jmcentire\n'
-  exit 0
-fi
-if [ "$1 $2 $3" = "api user -q" ] && [ "$4" = ".login" ]; then
-  if [ "${GH_TOKEN:-}" = "token-wander" ]; then
-    printf 'jmc-wander\n'
-  else
-    printf 'jmcentire\n'
-  fi
-  exit 0
-fi
-exit 1
-"#,
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let path = format!(
-        "{}:{}:/usr/bin:/bin",
-        shim_dir.display(),
-        fake_bin.display()
-    );
-    let missing_policy = dir.path().join("missing-policy.yaml");
-    let missing_rules = dir.path().join("missing-rules.yaml");
-    let mut command = Command::new(env!(concat!("CARGO_BIN_EXE_", "signet", "-", "eval")));
-    command
-        .args([
-            "--policy-path",
-            missing_policy.to_str().unwrap(),
-            "--rules-path",
-            missing_rules.to_str().unwrap(),
-        ])
-        .env("HOME", &home)
-        .env("PATH", path)
-        .env("SIGNET_DIR", &state_dir)
-        .env("FAKE_GH_LOG", state_dir.join("fake-gh.log"))
-        .env_remove("GH_AS")
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .current_dir(&repository)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = command.spawn().expect("failed to start permissions hook");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    (
-        dir,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
-#[test]
-fn test_hook_installs_identity_check_before_allowing_git_push() {
-    let (dir, out, code) = run_identity_hook(
-        r#"{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "allow", "output: {out}");
-    let installed = dir
-        .path()
-        .join("state")
-        .join("checks")
-        .join("gh-identity-matches-remote");
-    assert!(
-        installed.is_file(),
-        "built-in identity check was not installed"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_ne!(
-            std::fs::metadata(installed).unwrap().permissions().mode() & 0o100,
-            0
-        );
-    }
-}
-
-#[test]
-fn test_hook_identity_check_uses_explicit_target_not_current_checkout() {
-    let (_dir, out, code) = run_identity_hook(
-        r#"{"tool_name":"Bash","tool_input":{"command":"git clone https://github.com/wandercom/example.git"}}"#,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "deny", "output: {out}");
-    assert!(out.contains("jmc-wander"), "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_uses_git_c_and_named_remote() {
-    let target = tempfile::tempdir().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .arg(target.path())
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args(["-C"])
-        .arg(target.path())
-        .args([
-            "remote",
-            "add",
-            "upstream",
-            "https://github.com/wandercom/example.git",
-        ])
-        .status()
-        .unwrap()
-        .success());
-    let command = format!("git -C {} fetch upstream", target.path().display());
-    let input = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": { "command": command },
-    })
-    .to_string();
-
-    let (dir, out, code) = run_identity_hook(&input);
-    let gh_log = std::fs::read_to_string(dir.path().join("state/fake-gh.log"))
-        .unwrap_or_else(|_| "<no gh calls>".into());
-    assert_eq!(code, 0);
-    assert_eq!(
-        parse_decision(&out),
-        "deny",
-        "output: {out}; gh calls: {gh_log}"
-    );
-    assert!(out.contains("jmc-wander"), "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_understands_full_github_api_urls() {
-    let (_dir, out, code) = run_identity_hook(
-        r#"{"tool_name":"Bash","tool_input":{"command":"gh api https://api.github.com/repos/wandercom/example"}}"#,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "deny", "output: {out}");
-    assert!(out.contains("jmc-wander"), "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_does_not_treat_gh_argument_as_git_operation() {
-    let target = tempfile::tempdir().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .arg(target.path())
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args(["-C"])
-        .arg(target.path())
-        .args(["config", "user.email", "jeremy@wander.com"])
-        .status()
-        .unwrap()
-        .success());
-    let input = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "gh workflow run push --repo jmcentire/example",
-            "workdir": target.path(),
-        },
-    })
-    .to_string();
-
-    let (_dir, out, code) = run_identity_hook(&input);
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "allow", "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_rejects_conflicting_inherited_github_token() {
-    let (_dir, out, code) = run_identity_hook_with_env(
-        r#"{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#,
-        &[("GITHUB_TOKEN", "token-wander")],
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "deny", "output: {out}");
-    assert!(out.contains("inherited GITHUB_TOKEN"), "output: {out}");
-}
-
 #[test]
 fn test_hook_denies_piped_exec() {
     let (out, code) = run_hook(
@@ -955,10 +709,88 @@ rules:
     assert!(out.contains("timed out"));
 }
 
+/// Run a Bash `deploy` call against one ENSURE rule whose custom message
+/// leaves out the check name, and return the hook output.
+fn run_ensure_with_custom_message(dir: &std::path::Path, check: &str, timeout: u32) -> String {
+    let policy = format!(
+        r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: ensure_test
+    tool_pattern: ".*"
+    conditions:
+      - "contains(parameters, 'deploy')"
+    action: ENSURE
+    ensure:
+      check: {check}
+      timeout: {timeout}
+      message: Deploy blocked
+"#
+    );
+    let (out, code) = run_hook_with_policy(
+        r#"{"tool_name":"Bash","tool_input":{"command":"deploy app"}}"#,
+        &policy,
+        dir,
+    );
+    assert_eq!(code, 0);
+    assert_eq!(parse_decision(&out), "deny", "{out}");
+    assert!(out.contains("Deploy blocked"), "{out}");
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_unspawnable_check_named_despite_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    let script = checks_dir.join("noexec-check");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = run_ensure_with_custom_message(dir.path(), "noexec-check", 5);
+    assert!(out.contains("'noexec-check'"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_timed_out_check_named_despite_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    let script = checks_dir.join("hang-check");
+    std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = run_ensure_with_custom_message(dir.path(), "hang-check", 1);
+    assert!(out.contains("'hang-check'"), "{out}");
+    assert!(out.contains("timed out"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_escaping_check_named_despite_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    let outside = dir.path().join("outside-script");
+    std::fs::write(&outside, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&outside, checks_dir.join("escape-check")).unwrap();
+
+    let out = run_ensure_with_custom_message(dir.path(), "escape-check", 5);
+    assert!(out.contains("'escape-check'"), "{out}");
+    assert!(out.contains("escapes checks directory"), "{out}");
+}
+
 #[test]
 fn test_hook_ensure_missing_script() {
-    // Unlocked ensure rule with missing script → allow gracefully.
-    // (Locked ensure with missing script would deny — tested via self-protection.)
+    // An operator-authored ensure rule whose script is absent cannot be
+    // evaluated, so it denies and says why instead of allowing silently.
     let dir = tempfile::tempdir().unwrap();
     let checks_dir = dir.path().join("checks");
     std::fs::create_dir_all(&checks_dir).unwrap();
@@ -986,7 +818,77 @@ rules:
         dir.path(),
     );
     assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "allow");
+    assert_eq!(parse_decision(&out), "deny");
+    assert!(out.contains("Script missing"), "{out}");
+    assert!(out.contains("nonexistent-script"), "{out}");
+}
+
+#[test]
+fn test_hook_ensure_missing_checks_dir_denies() {
+    // No checks directory at all, as on a machine where rules.yaml was synced
+    // without ~/.signet/checks/.
+    let dir = tempfile::tempdir().unwrap();
+
+    let policy = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: ensure_test
+    tool_pattern: "^Bash$"
+    conditions:
+      - "contains(parameters, 'push')"
+    action: ENSURE
+    ensure:
+      check: identity-check
+      timeout: 5
+"#;
+
+    let (out, code) = run_hook_with_policy(
+        r#"{"tool_name":"Bash","tool_input":{"command":"git push"}}"#,
+        policy,
+        dir.path(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(parse_decision(&out), "deny");
+    assert!(out.contains("identity-check"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_dangling_symlink_denies() {
+    // A check that links to a script which no longer exists cannot be
+    // canonicalized, and must deny like any other missing script.
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("removed-script"),
+        checks_dir.join("linked-check"),
+    )
+    .unwrap();
+
+    let policy = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: ensure_test
+    tool_pattern: "^Bash$"
+    conditions:
+      - "contains(parameters, 'push')"
+    action: ENSURE
+    ensure:
+      check: linked-check
+      timeout: 5
+"#;
+
+    let (out, code) = run_hook_with_policy(
+        r#"{"tool_name":"Bash","tool_input":{"command":"git push"}}"#,
+        policy,
+        dir.path(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(parse_decision(&out), "deny");
+    assert!(out.contains("linked-check"), "{out}");
 }
 
 #[test]
