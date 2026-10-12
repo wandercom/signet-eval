@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+- Cursor adapter (`--adapter cursor`) for `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, and `beforeReadFile`, with a sample `hooks/cursor-hooks.json`. Shell calls map to `Bash`, MCP calls carry their server identity, and Signet `ASK` reaches Cursor's approval prompt only for shell commands; elsewhere it denies. Malformed payloads deny in Cursor's response shape.
+- Muse Code adapter (`--adapter muse`) for `PreToolUse` and `PermissionRequest`, with a sample `hooks/muse-hooks.json`. Muse native tool names map to Signet's canonical names; `ALLOW` emits no output because Muse rejects a bare allow, and `ASK` denies because Muse ignores it.
+- `block_delete_tool` system default denies Cursor's native `Delete` tool, which `block_rm` never saw.
+
 ### Changed
 - An ENSURE rule whose check script is missing or cannot be resolved now denies with a reason naming the check. Before, an unlocked rule allowed the call silently, which was only safe while the binary installed its own identity check. Copy `~/.signet/checks/` along with any `rules.yaml` that refers to it. A check that cannot run for any other reason (not executable, timed out, input too large) also names the check, even when the rule sets a custom `message`.
 - ENSURE scripts get `SIGNET_TOOL_CWD_SOURCE` (`tool_input`, `host` or `process`) and `SIGNET_HOST_CWD` next to `SIGNET_TOOL_CWD`, so a check can tell a model-supplied directory from the host's. An empty tool `cwd` no longer hides the host value.

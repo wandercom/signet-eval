@@ -264,6 +264,44 @@ fn test_test_command_accepts_antigravity_payload() {
 }
 
 #[test]
+fn test_test_command_accepts_cursor_and_muse_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy.yaml");
+    let rules_path = dir.path().join("rules.yaml");
+    let path_str = policy_path.to_str().unwrap();
+    let rules_str = rules_path.to_str().unwrap();
+
+    signet_eval(&["--policy-path", path_str, "--rules-path", rules_str, "init"]);
+
+    for (adapter, payload) in [
+        (
+            "cursor",
+            r#"{"conversation_id":"c1","hook_event_name":"beforeShellExecution","command":"rm foo","cwd":"/tmp","sandbox":false}"#,
+        ),
+        (
+            "muse",
+            r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":"rm foo"},"session_id":"s1"}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = signet_eval(&[
+            "--adapter",
+            adapter,
+            "--policy-path",
+            path_str,
+            "--rules-path",
+            rules_str,
+            "test",
+            payload,
+        ]);
+        assert_eq!(code, 0, "{adapter} test failed: {stderr}");
+        assert!(
+            stdout.contains("Deny"),
+            "{adapter} stdout should contain Deny: {stdout}"
+        );
+    }
+}
+
+#[test]
 fn test_status_no_vault() {
     let (stdout, stderr, code) = signet_eval(&["status"]);
     // Without a vault, should tell user to set up (error goes to stderr)
