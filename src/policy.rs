@@ -1876,6 +1876,19 @@ pub fn system_default_rules() -> Vec<PolicyRule> {
             gate: None, ensure: None,
         inject: None,
     },
+        // Cursor's native Delete tool removes files without a shell command, so
+        // block_rm never sees it.
+        PolicyRule {
+            name: "block_delete_tool".into(),
+            tool_pattern: "^Delete$".into(),
+            conditions: vec!["true".into()],
+            action: Decision::Deny,
+            locked: false,
+            reason: Some("File deletion blocked.".into()),
+            alternative: Some("Use 'trash <file>' (recoverable) or 'mv <file> /tmp/'.".into()),
+            gate: None, ensure: None,
+        inject: None,
+    },
         PolicyRule {
             name: "block_force_push".into(),
             tool_pattern: "^Bash$".into(),
@@ -4732,8 +4745,8 @@ rules:
         let defaults = system_default_rules();
         assert_eq!(
             defaults.len(),
-            7,
-            "Should have exactly 7 universal safe defaults"
+            8,
+            "Should have exactly 8 universal safe defaults"
         );
         assert!(
             defaults.iter().all(|r| !r.locked),

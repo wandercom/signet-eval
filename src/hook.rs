@@ -92,6 +92,8 @@ pub enum HookAdapter {
     CodexPermission,
     Antigravity,
     OpenCode,
+    Cursor,
+    Muse,
 }
 
 impl HookAdapter {
@@ -102,8 +104,10 @@ impl HookAdapter {
             "codex-permission" | "codex-permission-request" => Ok(Self::CodexPermission),
             "antigravity" => Ok(Self::Antigravity),
             "opencode" => Ok(Self::OpenCode),
+            "cursor" => Ok(Self::Cursor),
+            "muse" => Ok(Self::Muse),
             _ => Err(format!(
-                "unknown adapter '{s}' (expected claude, codex, codex-permission, antigravity, or opencode)"
+                "unknown adapter '{s}' (expected claude, codex, codex-permission, antigravity, opencode, cursor, or muse)"
             )),
         }
     }
@@ -112,18 +116,34 @@ impl HookAdapter {
         match self {
             Self::Claude | Self::Antigravity | Self::OpenCode => HookEvent::PreToolUse,
             Self::CodexPermission => HookEvent::PermissionRequest,
-            Self::Codex => match input_event {
+            Self::Codex | Self::Muse => match input_event {
                 Some("PermissionRequest") => HookEvent::PermissionRequest,
+                _ => HookEvent::PreToolUse,
+            },
+            Self::Cursor => match input_event {
+                Some(CURSOR_SHELL_EVENT) => HookEvent::BeforeShellExecution,
+                Some(CURSOR_MCP_EVENT) => HookEvent::BeforeMcpExecution,
+                Some(CURSOR_READ_EVENT) => HookEvent::BeforeReadFile,
                 _ => HookEvent::PreToolUse,
             },
         }
     }
 }
 
+const CURSOR_SHELL_EVENT: &str = "beforeShellExecution";
+const CURSOR_MCP_EVENT: &str = "beforeMCPExecution";
+const CURSOR_READ_EVENT: &str = "beforeReadFile";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HookEvent {
     PreToolUse,
     PermissionRequest,
+    /// Cursor `beforeShellExecution`: the only Cursor event whose `ask` reaches a prompt.
+    BeforeShellExecution,
+    /// Cursor `beforeMCPExecution`: carries the MCP server identity `preToolUse` lacks.
+    BeforeMcpExecution,
+    /// Cursor `beforeReadFile`: allow or deny only.
+    BeforeReadFile,
 }
 
 /// Claude Code and Codex PreToolUse expect hook responses wrapped in hookSpecificOutput.
@@ -137,8 +157,8 @@ struct HookResponse {
 struct HookOutput {
     #[serde(rename = "hookEventName")]
     hook_event_name: String,
-    #[serde(rename = "permissionDecision")]
-    permission_decision: String,
+    #[serde(rename = "permissionDecision", skip_serializing_if = "Option::is_none")]
+    permission_decision: Option<String>,
     #[serde(
         rename = "permissionDecisionReason",
         skip_serializing_if = "Option::is_none"
@@ -168,6 +188,18 @@ struct CodexPermissionDecision {
     message: Option<String>,
 }
 
+/// Cursor permission hooks answer with a flat `permission` object (cursor-agent 2026.10.01).
+#[derive(Serialize)]
+struct CursorResponse {
+    permission: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_context: Option<String>,
+}
+
 #[derive(Serialize)]
 struct AntigravityResponse {
     decision: String,
@@ -191,10 +223,15 @@ impl HookInput {
         let Some(tool_name) = self.tool_name else {
             return Err("missing tool name".into());
         };
+        let parameters = self.parameters.unwrap_or(Value::Object(Default::default()));
+
+        if adapter == HookAdapter::Muse {
+            return normalize_muse_tool_call(tool_name, parameters);
+        }
 
         Ok(ToolCall {
             tool_name,
-            parameters: self.parameters.unwrap_or(Value::Object(Default::default())),
+            parameters,
         })
     }
 }
@@ -203,9 +240,147 @@ pub(crate) fn parse_tool_call_input(
     raw_input: Value,
     adapter: HookAdapter,
 ) -> Result<ToolCall, String> {
+    if adapter == HookAdapter::Cursor {
+        return normalize_cursor_input(raw_input);
+    }
     let hook_input: HookInput =
         serde_json::from_value(raw_input).map_err(|_| "Malformed hook input".to_string())?;
     hook_input.into_tool_call(adapter)
+}
+
+fn required_str(value: &Value, key: &str, host: &str) -> Result<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{host} {key} must be a non-empty string"))
+}
+
+/// Normalize a Cursor hook payload. Cursor names the event in `hook_event_name`;
+/// each pre-execution event has its own shape. The host-supplied identity is
+/// authoritative and overwrites lookalike fields from tool arguments.
+fn normalize_cursor_input(raw: Value) -> Result<ToolCall, String> {
+    let event = raw.get("hook_event_name").and_then(Value::as_str);
+    match event {
+        Some(CURSOR_SHELL_EVENT) => {
+            let mut parameters = Map::new();
+            parameters.insert(
+                "command".into(),
+                Value::String(required_str(&raw, "command", "Cursor")?),
+            );
+            // cursor-agent sends `cwd: ""` when the agent did not choose a directory.
+            if let Some(cwd) = raw
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+            {
+                parameters.insert("cwd".into(), Value::String(cwd.into()));
+            }
+            parameters.insert("agent_tool_name".into(), Value::String("Shell".into()));
+            Ok(ToolCall {
+                tool_name: "Bash".into(),
+                parameters: Value::Object(parameters),
+            })
+        }
+        Some(CURSOR_MCP_EVENT) => {
+            let server_name = required_str(&raw, "mcp_server_name", "Cursor")?;
+            let mcp_tool_name = required_str(&raw, "tool_name", "Cursor")?;
+            // Cursor serializes MCP arguments as a JSON string on this event.
+            let mut parameters = match raw.get("tool_input") {
+                Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+                    Ok(Value::Object(map)) => map,
+                    _ => return Err("Cursor tool_input must encode a JSON object".into()),
+                },
+                Some(Value::Object(map)) => map.clone(),
+                _ => return Err("Cursor tool_input must encode a JSON object".into()),
+            };
+            parameters.insert(
+                "agent_tool_name".into(),
+                Value::String(format!("MCP:{mcp_tool_name}")),
+            );
+            parameters.insert("mcp_server_name".into(), Value::String(server_name.clone()));
+            parameters.insert("mcp_tool_name".into(), Value::String(mcp_tool_name.clone()));
+            Ok(ToolCall {
+                tool_name: format!("mcp__{server_name}__{mcp_tool_name}"),
+                parameters: Value::Object(parameters),
+            })
+        }
+        Some(CURSOR_READ_EVENT) => {
+            // The payload also carries the file content; policy sees only the path,
+            // matching the Read tool on every other host.
+            let mut parameters = Map::new();
+            parameters.insert(
+                "file_path".into(),
+                Value::String(required_str(&raw, "file_path", "Cursor")?),
+            );
+            parameters.insert("agent_tool_name".into(), Value::String("Read".into()));
+            Ok(ToolCall {
+                tool_name: "Read".into(),
+                parameters: Value::Object(parameters),
+            })
+        }
+        _ => {
+            let tool_name = required_str(&raw, "tool_name", "Cursor")?;
+            let mut parameters = match raw.get("tool_input") {
+                None | Some(Value::Null) => Map::new(),
+                Some(Value::Object(map)) => map.clone(),
+                Some(_) => return Err("Cursor tool_input must be an object".into()),
+            };
+            let canonical_tool_name = match tool_name.as_str() {
+                "Shell" => {
+                    if parameters.get("cwd").and_then(Value::as_str) == Some("") {
+                        parameters.remove("cwd");
+                    }
+                    "Bash".to_owned()
+                }
+                _ => tool_name.clone(),
+            };
+            parameters.insert("agent_tool_name".into(), Value::String(tool_name));
+            Ok(ToolCall {
+                tool_name: canonical_tool_name,
+                parameters: Value::Object(parameters),
+            })
+        }
+    }
+}
+
+/// Map Muse native tool names onto Signet's canonical names. Muse sends its own
+/// tool names (e.g. `shell`) in Claude-shaped PreToolUse payloads.
+fn normalize_muse_tool_call(tool_name: String, parameters: Value) -> Result<ToolCall, String> {
+    let mut parameters = match parameters {
+        Value::Object(map) => map,
+        _ => return Err("Muse tool_input must be an object".into()),
+    };
+
+    let canonical_tool_name = match tool_name.as_str() {
+        "shell" | "bash" | "bash_input" | "exec_command" | "execute_command" => {
+            if !parameters.contains_key("command") {
+                copy_argument(&mut parameters, "cmd", "command");
+            }
+            "Bash"
+        }
+        "read_file" => "Read",
+        "write_file" => "Write",
+        "edit_file" => "Edit",
+        "search" => "Grep",
+        "web_fetch" => "WebFetch",
+        "web_search" => "WebSearch",
+        _ => tool_name.as_str(),
+    }
+    .to_owned();
+
+    if matches!(canonical_tool_name.as_str(), "Read" | "Write" | "Edit") {
+        // A native `path` argument is authoritative over a lookalike `file_path`.
+        copy_argument(&mut parameters, "path", "file_path");
+    }
+    parameters.insert("agent_tool_name".into(), Value::String(tool_name));
+
+    Ok(ToolCall {
+        tool_name: canonical_tool_name,
+        parameters: Value::Object(parameters),
+    })
 }
 
 fn copy_argument(map: &mut Map<String, Value>, source: &str, target: &str) {
@@ -643,6 +818,36 @@ fn emit_decision(
             };
             println!("{}", serde_json::to_string(&response).unwrap());
         }
+        (HookAdapter::Cursor, _) => {
+            emit_cursor_decision(event, decision, reason, additional_context)
+        }
+        (HookAdapter::Muse, HookEvent::PreToolUse) => {
+            // Muse PreToolUse enforces only deny: `ask` is ignored and a bare `allow`
+            // is rejected as a failed hook. Emit nothing (or context only) for allow
+            // and turn ask into deny, which also requires a non-empty reason.
+            match decision {
+                "allow" => {
+                    if additional_context.is_some() {
+                        emit_hook_specific_output("PreToolUse", None, None, additional_context);
+                    }
+                }
+                "ask" => emit_pre_tool_use_decision(
+                    "PreToolUse",
+                    "deny",
+                    Some(non_empty_or(
+                        reason,
+                        "Signet policy requires approval; Muse PreToolUse cannot ask.",
+                    )),
+                    additional_context,
+                ),
+                _ => emit_pre_tool_use_decision(
+                    "PreToolUse",
+                    "deny",
+                    Some(non_empty_or(reason, "Blocked by Signet policy.")),
+                    additional_context,
+                ),
+            }
+        }
         (HookAdapter::Codex | HookAdapter::CodexPermission, HookEvent::PreToolUse) => {
             // Codex PreToolUse currently only supports deny as an enforcing decision.
             // Allow/ask fail open in Codex, so emit no output for allow and turn ask into deny.
@@ -662,7 +867,10 @@ fn emit_decision(
                 _ => {}
             }
         }
-        (HookAdapter::Codex | HookAdapter::CodexPermission, HookEvent::PermissionRequest) => {
+        (
+            HookAdapter::Codex | HookAdapter::CodexPermission | HookAdapter::Muse,
+            HookEvent::PermissionRequest,
+        ) => {
             // PermissionRequest can explicitly allow/deny. For ASK, decline to decide so
             // Codex shows its normal approval prompt. Codex PermissionRequest has no separate
             // additionalContext channel, so inject payloads append to the `message` field with
@@ -687,7 +895,76 @@ fn emit_decision(
                 _ => {}
             }
         }
+        // Cursor-only events are never produced for these adapters; fail closed.
+        (
+            HookAdapter::Codex | HookAdapter::CodexPermission | HookAdapter::Muse,
+            HookEvent::BeforeShellExecution
+            | HookEvent::BeforeMcpExecution
+            | HookEvent::BeforeReadFile,
+        ) => emit_pre_tool_use_decision(
+            "PreToolUse",
+            "deny",
+            Some("Unsupported hook event for this adapter.".into()),
+            None,
+        ),
     }
+}
+
+fn non_empty_or(value: Option<String>, fallback: &str) -> String {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| fallback.into())
+}
+
+/// Cursor permission events: preToolUse honors only deny (ask is ignored), and
+/// cursor-agent ignores ask on beforeMCPExecution; beforeReadFile accepts only
+/// allow/deny. Only beforeShellExecution turns ask into a user prompt, so ask maps
+/// to deny everywhere else. Allow is emitted explicitly because empty output is
+/// a failed (fail-open) hook in Cursor.
+fn emit_cursor_decision(
+    event: HookEvent,
+    decision: &str,
+    reason: Option<String>,
+    additional_context: Option<String>,
+) {
+    let ask_supported = event == HookEvent::BeforeShellExecution;
+    let context_supported = event == HookEvent::PreToolUse;
+    let permission = match decision {
+        "allow" => "allow",
+        "ask" if ask_supported => "ask",
+        _ => "deny",
+    };
+
+    let (user_message, agent_message) = if permission == "allow" {
+        (None, None)
+    } else {
+        let message = if decision == "ask" && !ask_supported {
+            non_empty_or(
+                reason,
+                "Signet policy requires approval; this Cursor hook cannot ask.",
+            )
+        } else {
+            non_empty_or(reason, "Blocked by Signet policy.")
+        };
+        let agent_message = match (&additional_context, event) {
+            (_, HookEvent::BeforeReadFile) => None,
+            (Some(context), _) if !context_supported => Some(format!("{message}\n\n{context}")),
+            _ => Some(message.clone()),
+        };
+        (Some(message), agent_message)
+    };
+
+    let response = CursorResponse {
+        permission,
+        user_message,
+        agent_message,
+        additional_context: if context_supported {
+            additional_context
+        } else {
+            None
+        },
+    };
+    println!("{}", serde_json::to_string(&response).unwrap());
 }
 
 fn emit_pre_tool_use_decision(
@@ -696,10 +973,24 @@ fn emit_pre_tool_use_decision(
     reason: Option<String>,
     additional_context: Option<String>,
 ) {
+    emit_hook_specific_output(
+        hook_event_name,
+        Some(decision.into()),
+        reason,
+        additional_context,
+    );
+}
+
+fn emit_hook_specific_output(
+    hook_event_name: &str,
+    permission_decision: Option<String>,
+    reason: Option<String>,
+    additional_context: Option<String>,
+) {
     let response = HookResponse {
         hook_specific_output: HookOutput {
             hook_event_name: hook_event_name.into(),
-            permission_decision: decision.into(),
+            permission_decision,
             reason,
             additional_context,
         },
@@ -907,6 +1198,108 @@ mod tests {
         }));
         assert_eq!(multi_edit.tool_name, "MultiEdit");
         assert_eq!(multi_edit.parameters["file_path"], "/app/.env");
+    }
+
+    #[test]
+    fn cursor_shell_and_tool_identity_override_spoofed_arguments() {
+        let shell = parse_tool_call_input(
+            serde_json::json!({
+                "hook_event_name": "preToolUse",
+                "tool_name": "Shell",
+                "tool_input": {"command": "ls", "cwd": "/tmp", "agent_tool_name": "spoofed"}
+            }),
+            HookAdapter::Cursor,
+        )
+        .unwrap();
+        assert_eq!(shell.tool_name, "Bash");
+        assert_eq!(shell.parameters["command"], "ls");
+        assert_eq!(shell.parameters["agent_tool_name"], "Shell");
+
+        let before_shell = parse_tool_call_input(
+            serde_json::json!({
+                "hook_event_name": "beforeShellExecution",
+                "command": "git status",
+                "cwd": "/repo",
+                "sandbox": true
+            }),
+            HookAdapter::Cursor,
+        )
+        .unwrap();
+        assert_eq!(before_shell.tool_name, "Bash");
+        assert_eq!(before_shell.parameters["command"], "git status");
+        assert_eq!(before_shell.parameters["cwd"], "/repo");
+        assert!(before_shell.parameters.get("sandbox").is_none());
+
+        let empty_cwd = parse_tool_call_input(
+            serde_json::json!({
+                "hook_event_name": "beforeShellExecution",
+                "command": "ls",
+                "cwd": ""
+            }),
+            HookAdapter::Cursor,
+        )
+        .unwrap();
+        assert!(empty_cwd.parameters.get("cwd").is_none());
+
+        let mcp = parse_tool_call_input(
+            serde_json::json!({
+                "hook_event_name": "beforeMCPExecution",
+                "tool_name": "delete",
+                "tool_input": "{\"target\":\"prod\",\"mcp_server_name\":\"safe\"}",
+                "mcp_server_name": "danger"
+            }),
+            HookAdapter::Cursor,
+        )
+        .unwrap();
+        assert_eq!(mcp.tool_name, "mcp__danger__delete");
+        assert_eq!(mcp.parameters["target"], "prod");
+        assert_eq!(mcp.parameters["mcp_server_name"], "danger");
+        assert_eq!(mcp.parameters["mcp_tool_name"], "delete");
+        assert_eq!(mcp.parameters["agent_tool_name"], "MCP:delete");
+    }
+
+    #[test]
+    fn muse_native_tools_normalize_to_canonical_policy_fields() {
+        let parse = |tool: &str, input: Value| {
+            parse_tool_call_input(
+                serde_json::json!({
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": tool,
+                    "tool_input": input
+                }),
+                HookAdapter::Muse,
+            )
+            .unwrap()
+        };
+
+        let shell = parse("shell", serde_json::json!({"command": "ls"}));
+        assert_eq!(shell.tool_name, "Bash");
+        assert_eq!(shell.parameters["agent_tool_name"], "shell");
+
+        let exec = parse("exec_command", serde_json::json!({"cmd": "rm -rf /"}));
+        assert_eq!(exec.tool_name, "Bash");
+        assert_eq!(exec.parameters["command"], "rm -rf /");
+
+        let write = parse(
+            "write_file",
+            serde_json::json!({"path": "/app/.env", "file_path": "/spoofed"}),
+        );
+        assert_eq!(write.tool_name, "Write");
+        assert_eq!(write.parameters["file_path"], "/app/.env");
+
+        let read = parse("read_file", serde_json::json!({"file_path": "/a/b"}));
+        assert_eq!(read.tool_name, "Read");
+        assert_eq!(read.parameters["file_path"], "/a/b");
+
+        let mcp = parse("mcp__kindex__search", serde_json::json!({"query": "x"}));
+        assert_eq!(mcp.tool_name, "mcp__kindex__search");
+        assert_eq!(mcp.parameters["agent_tool_name"], "mcp__kindex__search");
+
+        let unknown = parse(
+            "apply_patch",
+            serde_json::json!({"input": "*** Begin Patch"}),
+        );
+        assert_eq!(unknown.tool_name, "apply_patch");
     }
 
     #[test]

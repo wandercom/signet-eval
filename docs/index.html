@@ -60,7 +60,7 @@
 <h2>Three Steps</h2>
 
 <p><strong>1.</strong> Install: <code>cargo install signet-eval</code></p>
-<p><strong>2.</strong> Hook into Claude Code, Codex, or Antigravity:</p>
+<p><strong>2.</strong> Hook into Claude Code, Codex, Antigravity, Cursor, or Muse Code:</p>
 <pre><code>{
   "hooks": {
     "PreToolUse": [{
@@ -85,6 +85,8 @@
     }]
   }
 }</code></pre>
+<p>Cursor: install <a href="https://github.com/wandercom/signet-eval/blob/main/hooks/cursor-hooks.json"><code>hooks/cursor-hooks.json</code></a> as <code>~/.cursor/hooks.json</code> or <code>&lt;repo&gt;/.cursor/hooks.json</code>. It runs <code>signet-eval --adapter cursor</code> on <code>preToolUse</code>, <code>beforeShellExecution</code>, and <code>beforeMCPExecution</code> with <code>failClosed: true</code>.</p>
+<p>Muse Code: add the <code>hooks</code> member of <a href="https://github.com/wandercom/signet-eval/blob/main/hooks/muse-hooks.json"><code>hooks/muse-hooks.json</code></a> to <code>~/.config/muse/settings.json</code>, or save it as <code>&lt;repo&gt;/.muse/hooks.json</code> in a trusted workspace. It runs <code>signet-eval --adapter muse</code> on <code>PreToolUse</code>.</p>
 <p><strong>3.</strong> Done. Every tool call now passes through policy evaluation.</p>
 
 <h2>Default Policy</h2>
@@ -184,9 +186,11 @@ rules:
                            (deterministic, 25ms, no NLP)</code></pre>
 
 <h2>Security Model</h2>
-<p>signet-eval is a <strong>seatbelt, not a cage.</strong> It enforces policy within cooperative protocols &mdash; Claude Code, Codex, and Antigravity call signet-eval around tool use and respect supported responses. This reliably blocks destructive commands, enforces spending limits, and gates credential access during normal operation.</p>
+<p>signet-eval is a <strong>seatbelt, not a cage.</strong> It enforces policy within cooperative protocols &mdash; Claude Code, Codex, Antigravity, Cursor, and Muse Code call signet-eval around tool use and respect supported responses. This reliably blocks destructive commands, enforces spending limits, and gates credential access during normal operation.</p>
 <p>Codex support maps to current Codex hook semantics: <code>PreToolUse</code> enforces deny decisions, while <code>PermissionRequest</code> can explicitly allow or deny requests Codex was already going to send through approval.</p>
 <p>Antigravity support consumes its nested <code>toolCall</code> payload, normalizes native command and file tools, unwraps <code>call_mcp_tool</code> into canonical MCP identity fields, and emits native top-level allow or deny decisions. Malformed wrappers fail closed.</p>
+<p>Cursor support answers with Cursor's <code>permission</code> object. Only <code>beforeShellExecution</code> can ask the user; on <code>preToolUse</code>, <code>beforeMCPExecution</code>, and <code>beforeReadFile</code> an ASK rule denies, because Cursor does not enforce ask there. Cursor fails open on a crashed or timed-out hook unless the entry sets <code>failClosed: true</code>.</p>
+<p>Muse Code support maps Muse's native tool names to canonical ones. Muse <code>PreToolUse</code> enforces only deny, so ASK denies and ALLOW emits no output. Muse has no fail-closed hook option: a failed hook lets the call proceed.</p>
 <p>It does <strong>not</strong> protect against an adversarial agent with shell access. Any process at the same privilege level can use shell indirection (<code>alias</code>, <code>eval</code>, <code>base64 | sh</code>) to evade string matching, read the session key, or replace the binary. No amount of pattern matching fixes this &mdash; it's an infinite regress.</p>
 <p>True containment requires <strong>OS-level controls</strong>: separate user accounts, containers, stripped <code>$PATH</code>, seccomp/AppArmor, or sandboxed environments. signet-eval is the policy engine inside such a perimeter. The OS enforces the perimeter. Neither replaces the other.</p>
 
@@ -197,6 +201,8 @@ rules:
   <tr><td><code>signet-eval --adapter codex</code></td><td>Codex <code>PreToolUse</code> evaluation</td></tr>
   <tr><td><code>signet-eval --adapter codex-permission</code></td><td>Codex <code>PermissionRequest</code> evaluation</td></tr>
   <tr><td><code>signet-eval --adapter antigravity</code></td><td>Antigravity <code>PreToolUse</code> evaluation</td></tr>
+  <tr><td><code>signet-eval --adapter cursor</code></td><td>Cursor pre-execution hook evaluation</td></tr>
+  <tr><td><code>signet-eval --adapter muse</code></td><td>Muse Code <code>PreToolUse</code> evaluation</td></tr>
   <tr><td><code>signet-eval init</code></td><td>Write default policy with locked self-protection</td></tr>
   <tr><td><code>signet-eval rules</code></td><td>Show current rules (locked rules tagged)</td></tr>
   <tr><td><code>signet-eval validate</code></td><td>Check policy for errors</td></tr>

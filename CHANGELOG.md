@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+- Cursor adapter (`--adapter cursor`) for `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, and `beforeReadFile`, with a sample `hooks/cursor-hooks.json`. Shell calls map to `Bash`, MCP calls carry their server identity, and Signet `ASK` reaches Cursor's approval prompt only for shell commands; elsewhere it denies. Malformed payloads deny in Cursor's response shape.
+- Muse Code adapter (`--adapter muse`) for `PreToolUse` and `PermissionRequest`, with a sample `hooks/muse-hooks.json`. Muse native tool names map to Signet's canonical names; `ALLOW` emits no output because Muse rejects a bare allow, and `ASK` denies because Muse ignores it.
+- `block_delete_tool` system default denies Cursor's native `Delete` tool, which `block_rm` never saw.
+
 ## [3.13.0] - 2026-09-24
 
 ### Added
