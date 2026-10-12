@@ -161,6 +161,44 @@ rules:
 
 Rules are evaluated in order — first match wins. Multiple conditions on a rule are AND'd. Rules with `locked: true` cannot be modified through the MCP management server.
 
+## ENSURE check context
+
+User-managed ENSURE scripts receive the original normalized tool name and input
+on stdin. `SIGNET_TOOL_COMMAND` carries the first non-empty string among the
+normalized `command` and `cmd` fields as a literal environment value. It is empty
+when neither field holds one.
+The forwarding mechanism does not interpret that value as shell code.
+
+`SIGNET_TOOL_CWD` uses the normalized tool `cwd`/`workdir`, then the host envelope's
+`cwd`, then the hook process's working directory. Empty values are skipped.
+`SIGNET_TOOL_CWD_SOURCE` says which one was used: `tool_input`, `host`, or `process`.
+`SIGNET_HOST_CWD` carries the host envelope's `cwd` on its own, or is empty when the
+host sent none. A `tool_input` directory is where the host will run the command, but
+the model wrote it. The process fallback is not an independently verified execution
+directory. None of these is a trusted location attestation, and a check that
+authorizes on location should look at the source before relying on the value.
+Signet does not interpret the command, so a `cd` inside it does not change
+`SIGNET_TOOL_CWD`. All of these environment values replace inherited ones, and stdin
+remains unchanged.
+
+A missing or unresolvable check script denies the call with a reason naming the
+check, for user rules as well as locked ones. Signet installs no check scripts, so
+copy `~/.signet/checks/` along with any `rules.yaml` that refers to it.
+
+Older releases shipped a `github_identity_guard` system rule. A copy of it left in
+`policy.yaml` is ignored, and `signet-eval validate` reports it as a warning. To keep
+an identity check, put the rule in `rules.yaml` with a script you maintain.
+
+From the repository root after `cargo build --release`, run the independent local
+acceptance checks with:
+
+```bash
+SIGNET_EVAL_BINARY="$(pwd)/target/release/signet-eval" python3 tests/test_ensure_behavior.py
+```
+
+These Python acceptance checks can run locally and are also collected by hosted
+CI on Linux and macOS against the release binary, alongside Rust and packaging checks.
+
 ## Advisory Injection
 
 `INJECT` rules probabilistically add advisory context near the tool call that

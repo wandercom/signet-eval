@@ -1016,7 +1016,7 @@ fn resolve_gate(config: &GateConfig, vault: Option<&Vault>) -> bool {
 pub fn load_policy(path: &Path) -> CompiledPolicy {
     match std::fs::read_to_string(path) {
         Ok(content) => match serde_yaml::from_str::<PolicyConfig>(&content) {
-            Ok(config) => CompiledPolicy::from_config(&config),
+            Ok(config) => CompiledPolicy::from_config(&overlay_current_system_rules(config)),
             Err(_) => default_policy(),
         },
         Err(_) => default_policy(),
@@ -1062,6 +1062,11 @@ pub fn load_merged_policy(policy_path: &Path, rules_path: &Path) -> CompiledPoli
     CompiledPolicy::from_config(&config)
 }
 
+/// Built-in rules that earlier releases shipped and `init` may have written into a
+/// `policy.yaml` snapshot. They are dropped on load like any other stale built-in,
+/// so removing one from the binary actually removes it from existing installs.
+const RETIRED_BUILT_IN_NAMES: &[&str] = &["github_identity_guard"];
+
 /// Reconcile a serialized system policy with the rules compiled into this binary.
 ///
 /// `policy.yaml` is a snapshot written by `init`. Without this overlay, installing
@@ -1070,11 +1075,12 @@ pub fn load_merged_policy(policy_path: &Path, rules_path: &Path) -> CompiledPoli
 /// by name; additional human-authored system rules are preserved.
 fn overlay_current_system_rules(installed: PolicyConfig) -> PolicyConfig {
     let baseline = baseline_system_config();
-    let built_in_names: std::collections::HashSet<String> = baseline
+    let mut built_in_names: std::collections::HashSet<String> = baseline
         .rules
         .iter()
         .map(|rule| rule.name.clone())
         .collect();
+    built_in_names.extend(RETIRED_BUILT_IN_NAMES.iter().map(|name| name.to_string()));
     let mut rules = baseline.rules;
     rules.extend(
         installed
@@ -1108,6 +1114,11 @@ pub fn merge_rules(system_rules: &[PolicyRule], user_rules: &[PolicyRule]) -> Ve
         }
     }
     merged
+}
+
+/// Load reconciled system configuration while preserving file/parse diagnostics.
+pub fn load_effective_policy_config(path: &Path) -> Result<PolicyConfig, String> {
+    load_policy_config(path).map(overlay_current_system_rules)
 }
 
 /// Load raw policy config from file.
@@ -1355,14 +1366,14 @@ pub fn validate_policy(config: &PolicyConfig) -> Vec<ValidationDiagnostic> {
                         });
                     }
 
-                    // Check if ensure script exists (warning, not error)
+                    // A missing script is a warning here; the hook denies matching calls.
                     match resolve_ensure_script_path(&ec.check) {
                         Ok(path) => {
                             if !path.exists() {
                                 diagnostics.push(ValidationDiagnostic {
                                     rule_name: label.clone(),
                                     severity: DiagnosticSeverity::Warning,
-                                    error: format!("Ensure script not found: {}", path.display()),
+                                    error: format!("Ensure script not found: {}; matching calls are denied until it exists", path.display()),
                                     fix_hint: format!("Install the script: touch {} && chmod +x {}", path.display(), path.display()),
                                     auto_fixable: false,
                                 });
@@ -1385,25 +1396,12 @@ pub fn validate_policy(config: &PolicyConfig) -> Vec<ValidationDiagnostic> {
                                 }
                             }
                         }
-                        Err(_)
-                            if cfg!(unix)
-                                && ec.check == crate::embedded_checks::GITHUB_IDENTITY_CHECK
-                                && std::fs::symlink_metadata(
-                                    crate::vault::signet_dir().join("checks").join(&ec.check),
-                                )
-                                .is_err_and(|error| {
-                                    error.kind() == std::io::ErrorKind::NotFound
-                                }) =>
-                        {
-                            // The binary installs this trusted script before its first
-                            // ENSURE use. Validation remains read-only on a fresh profile.
-                        }
                         Err(_) => {
                             // checks dir may not exist yet — just a warning
                             diagnostics.push(ValidationDiagnostic {
                                 rule_name: label.clone(),
                                 severity: DiagnosticSeverity::Warning,
-                                error: format!("Cannot resolve ensure script '{}' (checks directory may not exist)", ec.check),
+                                error: format!("Cannot resolve ensure script '{}' (checks directory may not exist); matching calls are denied until it resolves", ec.check),
                                 fix_hint: "Create ~/.signet/checks/ directory and place your script there.".into(),
                                 auto_fixable: false,
                             });
@@ -1417,10 +1415,56 @@ pub fn validate_policy(config: &PolicyConfig) -> Vec<ValidationDiagnostic> {
     diagnostics
 }
 
+/// Validate the stored system policy. A retired binary-owned rule gets one
+/// warning saying it is ignored, in place of diagnostics for a rule that never runs.
+/// User policy validation deliberately continues to use `validate_policy`.
+pub fn validate_system_policy(config: &PolicyConfig) -> Vec<ValidationDiagnostic> {
+    let mut diagnostics: Vec<_> = validate_policy(config)
+        .into_iter()
+        .filter(|diagnostic| !RETIRED_BUILT_IN_NAMES.contains(&diagnostic.rule_name.as_str()))
+        .collect();
+    diagnostics.extend(
+        config
+            .rules
+            .iter()
+            .filter(|rule| RETIRED_BUILT_IN_NAMES.contains(&rule.name.as_str()))
+            .map(|rule| ValidationDiagnostic {
+                rule_name: rule.name.clone(),
+                severity: DiagnosticSeverity::Warning,
+                error: "Retired built-in rule name; this system policy entry is ignored.".into(),
+                fix_hint: "To keep this rule, move it to rules.yaml (user rules are evaluated). \
+                           Otherwise delete it from the system policy."
+                    .into(),
+                auto_fixable: false,
+            }),
+    );
+    diagnostics
+}
+
+/// Repair stored system rules without persisting the compiled-default overlay.
+pub fn fix_system_policy(config: &mut PolicyConfig) -> PolicyFix {
+    if !config
+        .rules
+        .iter()
+        .any(|rule| RETIRED_BUILT_IN_NAMES.contains(&rule.name.as_str()))
+    {
+        return fix_policy(config);
+    }
+    let diagnostics = validate_system_policy(config);
+    fix_policy_diagnostics(config, diagnostics)
+}
+
 /// Auto-fix common policy issues. Never modifies locked rules.
 /// Removes broken unlocked rules and clamps out-of-range values.
 pub fn fix_policy(config: &mut PolicyConfig) -> PolicyFix {
     let diagnostics = validate_policy(config);
+    fix_policy_diagnostics(config, diagnostics)
+}
+
+fn fix_policy_diagnostics(
+    config: &mut PolicyConfig,
+    diagnostics: Vec<ValidationDiagnostic>,
+) -> PolicyFix {
     let mut removed = Vec::new();
     let mut modified = Vec::new();
     let mut rules_to_remove: Vec<String> = Vec::new();
@@ -1931,34 +1975,6 @@ pub fn system_default_rules() -> Vec<PolicyRule> {
             gate: None, ensure: None,
         inject: None,
     },
-        // Identity enforcement is an unlocked system default placed after the
-        // other Bash safety rules. A passing ENSURE therefore cannot authorize a
-        // force-push, rm, or other command that an earlier rule would stop.
-        PolicyRule {
-            name: "github_identity_guard".into(),
-            tool_pattern: "^Bash$".into(),
-            conditions: vec![
-                r"matches(parameters, '\bgit\b[^\n]*\b(push|pull|fetch|clone)\b|(^|[^[:alnum:]_-])gh[[:space:]]')".into(),
-            ],
-            action: Decision::Ensure,
-            locked: false,
-            reason: Some(
-                "GitHub operations must use the identity mapped from the target repository owner."
-                    .into(),
-            ),
-            alternative: Some(
-                "Use the configured per-process gh or Git credential shim for the target owner; \
-                 never switch the global gh account."
-                    .into(),
-            ),
-            gate: None,
-            ensure: Some(EnsureConfig {
-                check: "gh-identity-matches-remote".into(),
-                timeout: 15,
-                message: "GitHub identity does not match the target repository owner.".into(),
-            }),
-            inject: None,
-        },
     ]
 }
 
@@ -2005,21 +2021,6 @@ pub fn sample_yaml() -> String {
   reason: Core/DSL file modification requires confirmation.
   alternative: Work on net-new files only, or confirm core changes are in scope.
 
-# GitHub identity enforcement (already shipped; shown for customization only)
-# The binary installs its trusted check on the first matching evaluation.
-# Requires a check script at ~/.signet/checks/gh-identity-matches-remote
-# The script inspects the git remote URL and compares to the active gh user.
-- name: github_identity_guard
-  tool_pattern: "^Bash$"
-  conditions:
-    - "matches(parameters, '\\bgit\\b[^\\n]*\\b(push|pull|fetch|clone)\\b|(^|[^[:alnum:]_-])gh[[:space:]]')"
-  action: ENSURE
-  reason: GitHub operations must use the identity mapped from the target repository owner.
-  alternative: Use the configured per-process identity shim; never switch the global gh account.
-  ensure:
-    check: gh-identity-matches-remote
-    timeout: 15
-    message: GitHub identity does not match the target repository owner.
 "#.to_string()
 }
 
@@ -2121,7 +2122,6 @@ mod tests {
             serde_json::json!({"command": "git push --force origin main"}),
         );
         let result = evaluate(&call, &policy, None);
-        // block_force_push (Ask) fires before github_identity_guard (now at end of rules)
         assert_eq!(result.decision, Decision::Ask);
         assert_eq!(result.matched_rule.as_deref(), Some("block_force_push"));
     }
@@ -2869,8 +2869,6 @@ mod self_protection_tests {
         let rules = self_protection_rules();
         assert_eq!(rules.len(), 10);
         assert!(rules.iter().all(|r| r.locked));
-        // github_identity_guard should NOT be in self-protection rules
-        assert!(!rules.iter().any(|r| r.name == "github_identity_guard"));
         assert!(rules
             .iter()
             .any(|r| r.name == "prefer_persistent_task_store"));
@@ -3845,7 +3843,6 @@ mod gate_ensure_tests {
 
     #[test]
     fn test_validate_ensure_check_name_valid() {
-        assert!(validate_ensure_check_name("gh-identity-matches-remote").is_ok());
         assert!(validate_ensure_check_name("check_foo").is_ok());
         assert!(validate_ensure_check_name("my-script.sh").is_ok());
     }
@@ -3974,25 +3971,6 @@ mod gate_ensure_tests {
         assert!(errors
             .iter()
             .any(|e| e.error.contains("ensure.timeout must be 1-30")));
-    }
-
-    #[test]
-    fn test_github_identity_guard_is_shipped_unlocked_default() {
-        let policy = default_policy();
-        let guard = policy
-            .rules
-            .iter()
-            .find(|r| r.name == "github_identity_guard");
-        let guard = guard.expect("github_identity_guard must ship in default_policy");
-        assert!(
-            !guard.locked,
-            "human user rules must remain able to override it"
-        );
-        assert_eq!(guard.action, Decision::Ensure);
-        assert_eq!(
-            guard.ensure.as_ref().map(|config| config.check.as_str()),
-            Some("gh-identity-matches-remote")
-        );
     }
 
     #[test]
@@ -4440,7 +4418,23 @@ rules:
             user_position < system_position,
             "user rules must precede unlocked defaults"
         );
-        assert!(names.contains(&"github_identity_guard"));
+    }
+
+    #[test]
+    fn test_load_merged_policy_drops_retired_built_in_from_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy_path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &policy_path,
+            "version: 1\ndefault_action: ALLOW\nrules:\n- name: github_identity_guard\n  tool_pattern: '^Bash$'\n  conditions: ['true']\n  action: ENSURE\n  ensure:\n    check: gh-identity-matches-remote\n    timeout: 15\n- name: host_rule\n  tool_pattern: '^Bash$'\n  conditions: ['true']\n  action: ASK\n",
+        )
+        .unwrap();
+        let merged = load_merged_policy(&policy_path, &dir.path().join("rules.yaml"));
+        assert!(merged
+            .rules
+            .iter()
+            .all(|r| r.name != "github_identity_guard"));
+        assert!(merged.rules.iter().any(|r| r.name == "host_rule"));
     }
 
     #[test]
@@ -4674,29 +4668,6 @@ rules:
         crate::vault::clear_test_session_id();
     }
 
-    #[test]
-    fn test_identity_guard_catches_git_options_and_gh_targets() {
-        let policy = default_policy();
-        for command in [
-            "git -c credential.helper= push origin main",
-            "git -C /tmp/example fetch upstream",
-            "gh pr view --repo wandercom/example",
-            "/opt/homebrew/bin/gh api repos/meacjis/example",
-        ] {
-            let call = make_call("Bash", serde_json::json!({"command": command}));
-            let result = evaluate(&call, &policy, None);
-            assert_eq!(
-                result.decision,
-                Decision::Ensure,
-                "identity check did not match: {command}"
-            );
-            assert_eq!(
-                result.matched_rule.as_deref(),
-                Some("github_identity_guard")
-            );
-        }
-    }
-
     /// Malformed system policy.yaml must not silently drop user rules either.
     #[test]
     fn test_load_merged_policy_malformed_system_policy_loads_user_rules() {
@@ -4732,8 +4703,8 @@ rules:
         let defaults = system_default_rules();
         assert_eq!(
             defaults.len(),
-            7,
-            "Should have exactly 7 universal safe defaults"
+            6,
+            "Should have exactly 6 universal safe defaults"
         );
         assert!(
             defaults.iter().all(|r| !r.locked),
@@ -4755,22 +4726,22 @@ rules:
             policy.rules.iter().all(|r| r.name != "protect_core_files"),
             "protect_core_files should not be in defaults"
         );
-        let identity = policy
-            .rules
-            .iter()
-            .find(|rule| rule.name == "github_identity_guard")
-            .expect("github_identity_guard should be a shipped default");
-        assert!(!identity.locked);
+        assert!(
+            policy
+                .rules
+                .iter()
+                .all(|r| r.name != "github_identity_guard"),
+            "github_identity_guard should not be in defaults"
+        );
     }
 
     #[test]
     fn test_sample_yaml_parseable() {
         let yaml = sample_yaml();
         let rules: Vec<PolicyRule> = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].name, "require_plan_before_code");
         assert_eq!(rules[1].name, "protect_core_files");
-        assert_eq!(rules[2].name, "github_identity_guard");
     }
 }
 

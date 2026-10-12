@@ -40,7 +40,6 @@ signet-eval proxy              # MCP proxy
 
 ```
 src/
-  embedded_checks.rs — trusted ENSURE scripts installed atomically on first use
   main.rs          — CLI entry point (clap), 24 subcommands
   policy.rs        — Policy engine, condition functions, first-match-wins auth + advisory inject pass
   vault.rs         — Encrypted vault (Argon2id + AES-256-GCM), 3-tier, spending ledger, scoped credentials
@@ -81,7 +80,7 @@ examples/
 - **Policy HMAC integrity**: `signet-eval sign` writes HMAC sidecars for both policy.yaml and rules.yaml, verified on every hook eval when vault exists. MCP mutations auto-sign after every change.
 - **Tier 3 credentials** use compartment key (separate from session key, derived via HKDF)
 - **Scoped credential access**: `request_capability()` enforces domain, purpose, amount cap, and one-time constraints
-- **No NLP or eval() in core authorization** — regex and string comparison only. `ENSURE` may run a trusted external check (including the shipped GitHub identity check), and `INJECT` may run allowlisted commands for advisory payloads.
+- **No NLP or eval() in core authorization** — regex and string comparison only. `ENSURE` may run a trusted external check, and `INJECT` may run allowlisted commands for advisory payloads.
 
 ## Condition Functions
 
