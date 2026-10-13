@@ -314,6 +314,46 @@ and `{matched_param.X}`. See `examples/inject_examples.yaml`.
 | `has_current_session()` | Hook host supplied a distinct chat/session identifier | `has_current_session()` |
 | `true` / `false` | Literal | `true` |
 
+### Model-scoped rules
+
+Hook-mode calls can carry an `agent_model` field naming the model that issued
+the tool call. Only the host may supply it: Signet reads the hook envelope's
+`model` (a string, or an object with `id`) or Antigravity's `modelName`, and
+nothing else.
+
+- Any `agent_model` in tool input is discarded on every evaluation path (all
+  hook adapters, the MCP proxy and Kindex task admission), so the agent cannot
+  claim a model. The host still runs the original tool input.
+- Signet never reads the model from a session transcript. The agent can write
+  that file, so a model recorded there is a claim, not a fact.
+- Claude Code's classic `PreToolUse` input has no model field, so legacy
+  Claude hooks never see `agent_model`. The optional function adapter
+  (`adapters/claude-function`) passes the host's `$.session.model()` answer
+  when the host provides one. That is the session's model; whether it names a
+  subagent's own model is not qualified.
+- MCP proxy and Kindex admission calls have no host-attested model, so the
+  field is always absent there.
+- The field is attached only when a rule or the active preflight names
+  `agent_model`. Other policies see tool input exactly as before.
+
+When the model is unknown the field is absent and compares as an empty string.
+Write the condition as a negated allowlist so unknown models fail closed:
+
+```yaml
+- name: cloud_tools_require_opus
+  tool_pattern: "^Bash$"
+  conditions:
+    - "matches(command, '(^|[;&|(\\s])(gcloud|cloud-sql-proxy)(\\s|$)')"
+    - "not(matches(agent_model, '^claude-(opus|fable)-'))"
+  action: DENY
+  locked: true
+  reason: "gcloud and cloud-sql-proxy are limited to Opus and Fable"
+```
+
+On a host that reports no model, this rule denies every matching call.
+Command matching stays substring-based, so an agent determined to reach the
+same binary through an interpreter or wrapper script can still evade it.
+
 ## Encrypted Vault
 
 Three-tier encrypted storage with passphrase-derived key hierarchy (Argon2id + AES-256-GCM):

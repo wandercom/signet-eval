@@ -221,6 +221,17 @@ pub struct CompiledPolicy {
     pub has_inject_rules: bool,
 }
 
+impl CompiledPolicy {
+    /// True when any rule condition names `field`. Hook mode attaches
+    /// host-derived fields such as `agent_model` only for policies that read
+    /// them, so other policies see tool input unchanged.
+    pub fn names_param(&self, field: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.conditions.iter().any(|cond| cond.contains(field)))
+    }
+}
+
 pub struct EvaluationResult {
     pub decision: Decision,
     pub matched_rule: Option<String>,

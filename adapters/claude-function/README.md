@@ -101,6 +101,19 @@ explicit warning that Signet redaction is unavailable. This is an availability
 tradeoff for recovery prompts; avoid entering secrets while that warning is
 present. Confirmed disabled state forwards the original prompt neutrally.
 
+Before each policy evaluation the adapter asks the host for `$.session.model()`
+and, when the answer is a string, passes it as the envelope `model`. Policy
+sees it as `agent_model`. A host without that call, an error or a non-string
+answer omits the field, and model-scoped rules see `agent_model` as absent.
+Tool input never supplies it: the binary discards any `agent_model` there. The
+answer is the session's model; subagent attribution is not qualified. On
+2026-10-12 the adapter loaded and passed the host fixture on the exact 2.1.274
+and 2.1.280 builds and on 2.1.296 (default, `--deny-bash`, `--bash-error`,
+`--disable-policy`, and `--installed-plugin` on the two qualified builds).
+`--deny-bash --require-model` denies only when policy sees the Sonnet model
+the fixture runs, so it passes only if `$.session.model()` reached policy; an
+adapter copy without the call failed it on all three builds.
+
 When the host returns an error or no typed result, the adapter preserves its
 sanitized error text in the denial channel, including the underlying policy
 explanation. It never turns an error into a successful typed tool result.
@@ -265,6 +278,7 @@ process does not turn a committed task into a duplicate retry.
 cargo test
 python3 tests/claude_function_host.py
 python3 tests/claude_function_host.py --installed-plugin
+python3 tests/claude_function_host.py --deny-bash --require-model
 python3 tests/claude_function_host.py --kindex-plugin /absolute/kindex/src/kindex/claude_modern
 ```
 

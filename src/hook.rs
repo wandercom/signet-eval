@@ -240,12 +240,79 @@ pub(crate) fn parse_tool_call_input(
     raw_input: Value,
     adapter: HookAdapter,
 ) -> Result<ToolCall, String> {
-    if adapter == HookAdapter::Cursor {
-        return normalize_cursor_input(raw_input);
+    let mut call = if adapter == HookAdapter::Cursor {
+        normalize_cursor_input(raw_input)?
+    } else {
+        let hook_input: HookInput =
+            serde_json::from_value(raw_input).map_err(|_| "Malformed hook input".to_string())?;
+        hook_input.into_tool_call(adapter)?
+    };
+    strip_agent_model(&mut call);
+    Ok(call)
+}
+
+/// Parameter field exposing the issuing model to policy conditions,
+/// e.g. `not(matches(agent_model, '^claude-opus-'))`. Only a host envelope
+/// may supply it; every evaluation path strips the field from tool input.
+pub(crate) const AGENT_MODEL_FIELD: &str = "agent_model";
+
+/// Drop a caller-supplied `agent_model` so the agent cannot claim a model.
+/// Only the policy-evaluation copy changes; the host still runs the original
+/// tool input.
+pub(crate) fn strip_agent_model(call: &mut ToolCall) {
+    if let Value::Object(parameters) = &mut call.parameters {
+        parameters.remove(AGENT_MODEL_FIELD);
     }
-    let hook_input: HookInput =
-        serde_json::from_value(raw_input).map_err(|_| "Malformed hook input".to_string())?;
-    hook_input.into_tool_call(adapter)
+}
+
+/// Attach the host-reported model as `agent_model` when a rule or the active
+/// preflight names that field. Policies that never mention it see the tool
+/// input exactly as before.
+pub(crate) fn attach_agent_model(
+    raw_input: &Value,
+    policy: &CompiledPolicy,
+    vault: Option<&Vault>,
+    call: &mut ToolCall,
+) {
+    let preflight_names_model = || {
+        vault
+            .and_then(Vault::active_preflight)
+            .is_some_and(|preflight| {
+                preflight.constraints.iter().any(|constraint| {
+                    constraint
+                        .conditions
+                        .iter()
+                        .any(|cond| cond.contains(AGENT_MODEL_FIELD))
+                })
+            })
+    };
+    if !policy.names_param(AGENT_MODEL_FIELD) && !preflight_names_model() {
+        return;
+    }
+    let Some(model) = host_agent_model(raw_input) else {
+        return;
+    };
+    if let Value::Object(parameters) = &mut call.parameters {
+        parameters.insert(AGENT_MODEL_FIELD.into(), Value::String(model));
+    }
+}
+
+/// The model the host reports in its own hook envelope: `model` (Codex,
+/// Cursor and the Claude function adapter) or `modelName` (Antigravity), as a
+/// string or an object with `id`. Tool input is never consulted, and neither
+/// is the session transcript: the agent can write that file, so a model read
+/// from it is a claim, not a fact. With no envelope field the model is absent.
+fn host_agent_model(raw_input: &Value) -> Option<String> {
+    ["model", "modelName"]
+        .iter()
+        .find_map(|key| match raw_input.get(*key) {
+            Some(Value::String(model)) => Some(model.as_str()),
+            Some(Value::Object(model)) => model.get("id").and_then(Value::as_str),
+            _ => None,
+        })
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_owned)
 }
 
 fn required_str(value: &Value, key: &str, host: &str) -> Result<String, String> {
@@ -534,7 +601,7 @@ pub fn run_hook_with_adapter(
         .get("cwd")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let call = match parse_tool_call_input(raw_input, adapter) {
+    let mut call = match parse_tool_call_input(raw_input.clone(), adapter) {
         Ok(call) => call,
         Err(_) => {
             emit_deny(adapter, event, "Malformed hook input");
@@ -544,6 +611,7 @@ pub fn run_hook_with_adapter(
 
     // Check if paused — if so, only enforce locked (self-protection) rules
     // File-based global pause OR session-scoped global pause from pauses.json
+    attach_agent_model(&raw_input, policy, vault, &mut call);
     if crate::vault::is_paused_file() || crate::vault::is_globally_paused_json() {
         let result = policy::evaluate(&call, policy, vault);
         if result.decision == Decision::Deny && result.matched_locked {
@@ -1342,5 +1410,265 @@ mod tests {
         assert_eq!(call.parameters["mcp_server_name"], "danger");
         assert_eq!(call.parameters["mcp_tool_name"], "delete");
         assert!(call.parameters.get("Arguments").is_none());
+    }
+
+    const MODEL_GATE_POLICY: &str = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: cloud_tools_require_opus
+    tool_pattern: "^Bash$"
+    conditions:
+      - "matches(command, '(^|[;&|(\\s])(gcloud|cloud-sql-proxy)(\\s|$)')"
+      - "not(matches(agent_model, '^claude-opus-'))"
+    action: DENY
+    reason: "gcloud/cloud-sql-proxy restricted to Opus"
+"#;
+
+    fn model_gate_policy() -> CompiledPolicy {
+        CompiledPolicy::from_config(&serde_yaml::from_str(MODEL_GATE_POLICY).unwrap())
+    }
+
+    /// Parse and enrich exactly as hook mode does under a policy that reads agent_model.
+    fn parse_with_model(input: Value, adapter: HookAdapter) -> ToolCall {
+        let mut call = parse_tool_call_input(input.clone(), adapter).unwrap();
+        attach_agent_model(&input, &model_gate_policy(), None, &mut call);
+        call
+    }
+
+    fn claude_model(input: Value) -> Option<String> {
+        parse_with_model(input, HookAdapter::Claude).parameters["agent_model"]
+            .as_str()
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn agent_model_comes_from_the_host_envelope() {
+        let model = claude_model(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud auth list"},
+            "model": {"id": "claude-sonnet-5-5", "display_name": "Sonnet"}
+        }));
+        assert_eq!(model.as_deref(), Some("claude-sonnet-5-5"));
+
+        // Antigravity's live payload carries the model as camel-case modelName.
+        let call = parse_with_model(
+            serde_json::json!({
+                "conversationId": "4989a389-5729-4c84-9e4f-44bb9044633a",
+                "modelName": "gemini-pro-agent",
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "gcloud auth list", "Cwd": "/tmp"}}
+            }),
+            HookAdapter::Antigravity,
+        );
+        assert_eq!(call.parameters["agent_model"], "gemini-pro-agent");
+
+        let call = parse_with_model(
+            serde_json::json!({
+                "hook_event_name": "beforeShellExecution",
+                "model": "gpt-5.5",
+                "command": "gcloud auth list",
+                "cwd": "/tmp"
+            }),
+            HookAdapter::Cursor,
+        );
+        assert_eq!(call.parameters["agent_model"], "gpt-5.5");
+    }
+
+    #[test]
+    fn agent_model_is_absent_without_a_host_field() {
+        for model in [
+            Value::Null,
+            Value::String("  ".into()),
+            serde_json::json!({}),
+        ] {
+            let found = claude_model(serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "gcloud auth list"},
+                "model": model
+            }));
+            assert_eq!(found, None);
+        }
+    }
+
+    /// The transcript is agent-writable, so a model recorded there is never
+    /// promoted to `agent_model`, even for the exact issuing entry.
+    #[test]
+    fn agent_model_ignores_the_agent_writable_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = dir.path().join("session.jsonl");
+        let lines = [
+            serde_json::json!({"type": "assistant", "message": {"model": "claude-opus-5-5",
+                "content": [{"type": "tool_use", "id": "toolu_real", "name": "Bash"}]}}),
+            serde_json::json!({"type": "turn_context", "payload": {"model": "claude-opus-5-5"}}),
+        ];
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let input = serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "gcloud sql connect"},
+            "transcript_path": transcript,
+            "tool_use_id": "toolu_real"
+        });
+        let started = std::time::Instant::now();
+        let call = parse_with_model(input, HookAdapter::Claude);
+        assert!(call.parameters.get("agent_model").is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "no transcript polling"
+        );
+        assert_eq!(
+            policy::evaluate(&call, &model_gate_policy(), None).decision,
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn agent_model_cannot_be_spoofed_through_tool_input_on_any_adapter() {
+        let cases = [
+            (
+                HookAdapter::Claude,
+                serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "gcloud sql connect", "agent_model": "claude-opus-5-5"}}),
+            ),
+            (
+                HookAdapter::Codex,
+                serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "gcloud sql connect", "agent_model": "claude-opus-5-5"}}),
+            ),
+            (
+                HookAdapter::OpenCode,
+                serde_json::json!({"tool_name": "Bash", "args": {"command": "gcloud sql connect", "agent_model": "claude-opus-5-5"}}),
+            ),
+            (
+                HookAdapter::Muse,
+                serde_json::json!({"hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": {"command": "gcloud sql connect", "agent_model": "claude-opus-5-5"}}),
+            ),
+            (
+                HookAdapter::Antigravity,
+                serde_json::json!({"toolCall": {"name": "run_command", "args": {"CommandLine": "gcloud sql connect", "Cwd": "/tmp", "agent_model": "claude-opus-5-5"}}}),
+            ),
+            (
+                HookAdapter::Cursor,
+                serde_json::json!({"hook_event_name": "preToolUse", "tool_name": "Shell", "tool_input": {"command": "gcloud sql connect", "agent_model": "claude-opus-5-5"}}),
+            ),
+            (
+                HookAdapter::Cursor,
+                serde_json::json!({"hook_event_name": "beforeMCPExecution", "mcp_server_name": "cloud", "tool_name": "Bash",
+                    "tool_input": "{\"command\":\"gcloud sql connect\",\"agent_model\":\"claude-opus-5-5\"}"}),
+            ),
+        ];
+        let policy = model_gate_policy();
+        for (adapter, input) in cases {
+            let call = parse_tool_call_input(input.clone(), adapter).unwrap();
+            assert!(call.parameters.get("agent_model").is_none(), "{adapter:?}");
+            let call = parse_with_model(input, adapter);
+            assert!(call.parameters.get("agent_model").is_none(), "{adapter:?}");
+            if call.tool_name == "Bash" {
+                assert_eq!(
+                    policy::evaluate(&call, &policy, None).decision,
+                    Decision::Deny,
+                    "{adapter:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn agent_model_is_only_attached_when_policy_names_it() {
+        let attached = |policy: &CompiledPolicy| {
+            let input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "model": "claude-opus-5-5"
+            });
+            let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+            attach_agent_model(&input, policy, None, &mut call);
+            call.parameters.get("agent_model").is_some()
+        };
+        assert!(attached(&model_gate_policy()));
+        assert!(!attached(&policy::default_policy()));
+    }
+
+    #[test]
+    fn agent_model_is_attached_for_active_preflight_constraints() {
+        crate::vault::set_test_session_id(None);
+        let dir = tempfile::tempdir().unwrap();
+        let key = crate::vault::derive_master_key("testpass", &[0u8; 16]);
+        let vault = Vault::new(key, dir.path().join("state.db"));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        vault
+            .store_preflight(&Preflight {
+                id: "opus-only".into(),
+                task: "cloud work".into(),
+                risks: vec![],
+                constraints: vec![SoftConstraint {
+                    name: "gcloud_requires_opus".into(),
+                    tool_pattern: "^Bash$".into(),
+                    conditions: vec![
+                        "matches(command, '^gcloud ')".into(),
+                        "not(matches(agent_model, '^claude-opus-'))".into(),
+                    ],
+                    action: "DENY".into(),
+                    reason: "gcloud is Opus-only".into(),
+                    alternative: "hand off to Opus".into(),
+                }],
+                submitted_at: now,
+                lockout_until: now + 3600,
+                violation_count: 0,
+                escalated: false,
+                session_id: None,
+            })
+            .unwrap();
+        let preflight = vault.active_preflight().unwrap();
+
+        // The hard policy never names agent_model; only the constraint does.
+        let policy = policy::default_policy();
+        let violates = |model: &str| {
+            let input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "gcloud sql connect"},
+                "model": model
+            });
+            let mut call = parse_tool_call_input(input.clone(), HookAdapter::Claude).unwrap();
+            attach_agent_model(&input, &policy, Some(&vault), &mut call);
+            evaluate_preflight_constraint(&call, &preflight, &vault).is_some()
+        };
+        assert!(!violates("claude-opus-5-5"));
+        assert!(violates("claude-haiku-4-5-20251001"));
+        crate::vault::clear_test_session_id();
+    }
+
+    #[test]
+    fn agent_model_gates_cloud_tools_and_fails_closed_when_unknown() {
+        let compiled = model_gate_policy();
+        let decide = |command: &str, model: Option<&str>| {
+            let mut input = serde_json::json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": command}
+            });
+            if let Some(model) = model {
+                input["model"] = Value::String(model.into());
+            }
+            let call = parse_with_model(input, HookAdapter::Claude);
+            policy::evaluate(&call, &compiled, None).decision
+        };
+        let gcloud = "gcloud sql instances list";
+        assert_eq!(decide(gcloud, Some("claude-opus-5-5")), Decision::Allow);
+        assert_eq!(
+            decide(gcloud, Some("claude-haiku-4-5-20251001")),
+            Decision::Deny
+        );
+        assert_eq!(decide(gcloud, None), Decision::Deny);
+        assert_eq!(
+            decide("ls", Some("claude-haiku-4-5-20251001")),
+            Decision::Allow
+        );
     }
 }

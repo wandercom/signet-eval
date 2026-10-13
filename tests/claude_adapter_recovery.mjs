@@ -55,11 +55,11 @@ const response = value => ({ exitCode: 0, stdout: JSON.stringify(value), stderr:
 const tests = [];
 const test = (name, run) => tests.push({ name, run });
 
-function harness(initial = ACTIVE, config = {}) {
+function harness(initial = ACTIVE, config = {}, session = {}) {
   const hooks = new Map();
   const state = { owner: initial, policy: 'allow', redact: null, calls: [], statuses: [] };
   const $ = {
-    session: { async id() { return 'independent-recovery-test'; }, async cwd() { return '/synthetic/project'; } },
+    session: { async id() { return 'independent-recovery-test'; }, async cwd() { return '/synthetic/project'; }, ...session },
     process: { async run(argv, options) {
       const input = JSON.parse(options.stdin);
       const action = argv.includes('integration') ? argv[argv.indexOf('integration') + 1] : 'policy';
@@ -223,6 +223,27 @@ test('GREEN R4 policy evaluates original command, not sanitized projection', asy
   const evaluations = observed.calls.filter(x => x.action === 'policy');
   assert.equal(evaluations.length, 1, 'R4: exactly one original-input policy evaluation');
   assert.equal(evaluations[0].input.tool_input.command, CANARY, 'R4 / CLAUDE.md Security Model: policy receives original input');
+});
+
+test('GREEN host-reported model reaches the policy envelope', async () => {
+  const h = harness(ACTIVE, {}, { async model() { return 'claude-sonnet-5-5'; } });
+  await h.invoke('session.start');
+  const observed = await h.invoke('classic.PreToolUse', { ...EVENTS['classic.PreToolUse'], agent_model: 'claude-opus-5-5' });
+  const evaluations = observed.calls.filter(x => x.action === 'policy');
+  assert.equal(evaluations.length, 1, 'one policy evaluation');
+  assert.equal(evaluations[0].input.model, 'claude-sonnet-5-5', 'envelope carries the host model');
+  assert.equal(observed.nextCalls.length, 1, 'policy allow keeps host flow');
+});
+test('GREEN host without a model answer omits the envelope field', async () => {
+  for (const session of [{}, { async model() { throw new Error(CANARY); } }, { async model() { return { id: 42 }; } }]) {
+    const h = harness(ACTIVE, {}, session);
+    await h.invoke('session.start');
+    const observed = await h.invoke('classic.PreToolUse');
+    const evaluations = observed.calls.filter(x => x.action === 'policy');
+    assert.equal(evaluations.length, 1, 'policy still evaluates');
+    assert.equal('model' in evaluations[0].input, false, 'no model field without a host string');
+    assert.equal(observed.nextCalls.length, 1, 'policy allow keeps host flow');
+  }
 });
 
 let failed = 0;

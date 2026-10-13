@@ -123,10 +123,7 @@ impl ServerHandler for ProxyServer {
                 .as_ref()
                 .map(|a| serde_json::Value::Object(a.clone()))
                 .unwrap_or_default();
-            let call = ToolCall {
-                tool_name: tool_name.clone(),
-                parameters: args_value.clone(),
-            };
+            let call = policy_call(&tool_name, &args_value);
             let result = policy::evaluate(&call, &current_policy, self.vault.as_ref());
 
             // Log
@@ -234,6 +231,19 @@ impl ServerHandler for ProxyServer {
     }
 }
 
+/// The call policy evaluates for a proxied tool. An MCP client cannot vouch
+/// for the model behind it, so a caller-supplied `agent_model` is dropped and
+/// model-scoped rules see the field as absent. The upstream still receives
+/// the original arguments.
+fn policy_call(tool_name: &str, arguments: &serde_json::Value) -> ToolCall {
+    let mut call = ToolCall {
+        tool_name: tool_name.to_string(),
+        parameters: arguments.clone(),
+    };
+    crate::hook::strip_agent_model(&mut call);
+    call
+}
+
 async fn connect_upstream(
     name: &str,
     config: &UpstreamConfig,
@@ -305,4 +315,38 @@ pub async fn run_proxy() -> Result<(), Box<dyn std::error::Error>> {
     let service = rmcp::serve_server(proxy, rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proxied_calls_cannot_claim_a_model() {
+        let policy = policy::CompiledPolicy::from_config(
+            &serde_yaml::from_str(
+                r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: deploy_requires_opus
+    tool_pattern: "^cloud__deploy$"
+    conditions:
+      - "not(matches(agent_model, '^claude-opus-'))"
+    action: DENY
+"#,
+            )
+            .unwrap(),
+        );
+        let arguments = serde_json::json!({"target": "prod", "agent_model": "claude-opus-5-5"});
+        let call = policy_call("cloud__deploy", &arguments);
+        assert!(call.parameters.get("agent_model").is_none());
+        assert_eq!(call.parameters["target"], "prod");
+        assert_eq!(
+            policy::evaluate(&call, &policy, None).decision,
+            Decision::Deny
+        );
+        // The upstream request is built from the untouched original arguments.
+        assert_eq!(arguments["agent_model"], "claude-opus-5-5");
+    }
 }

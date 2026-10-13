@@ -31,7 +31,11 @@ parser.add_argument("--installed-plugin", action="store_true")
 host_error_mode = parser.add_mutually_exclusive_group()
 host_error_mode.add_argument("--deny-bash", action="store_true", help="Verify policy refusal detail and absent shell effect")
 host_error_mode.add_argument("--bash-error", action="store_true", help="Verify real shell failure detail without re-execution")
+parser.add_argument("--require-model", action="store_true",
+                    help="With --deny-bash: deny only when policy sees the host-reported agent_model")
 args = parser.parse_args()
+if args.require_model and not args.deny_bash:
+    parser.error("--require-model refines --deny-bash")
 if (args.deny_bash or args.bash_error) and (args.kindex_plugin or args.disable_policy or args.disable_before_task or args.deny_task or args.deny_native_secret):
     parser.error("Bash failure probes require active policy and no task fixture")
 repo = Path(__file__).resolve().parents[1]
@@ -63,9 +67,12 @@ marker = project / "bash-effect-marker"
 policy_failure_reason = "Synthetic Bash policy refusal remains visible"
 shell_failure_reason = "Synthetic shell execution failure remains visible"
 if args.deny_bash:
+    # --require-model: the refusal only fires when the adapter passed the host's
+    # $.session.model() answer through as agent_model (the fixture runs Sonnet).
+    condition = "\"matches(agent_model, '^claude-sonnet-4-5')\"" if args.require_model else "'true'"
     (root / "home/.signet/rules.yaml").write_text(
         "- name: synthetic_bash_refusal\n  tool_pattern: '^Bash$'\n"
-        "  conditions: ['true']\n  action: DENY\n  reason: " + policy_failure_reason + "\n"
+        "  conditions: [" + condition + "]\n  action: DENY\n  reason: " + policy_failure_reason + "\n"
     )
 
 
