@@ -3,6 +3,7 @@ mod hook;
 mod integration;
 mod policy;
 mod redaction;
+mod secret_mask;
 mod vault;
 
 #[cfg(feature = "mcp")]
@@ -156,6 +157,24 @@ fn expand_home(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// One status line for known-secret masking: names, never values.
+fn secret_mask_status() -> String {
+    match secret_mask::summary() {
+        None => format!(
+            "Secret masking: off (no {})",
+            secret_mask::config_path().display()
+        ),
+        Some((names, files)) if names.is_empty() => {
+            format!("Secret masking: on, no values from {files} reference file(s)")
+        }
+        Some((names, files)) => format!(
+            "Secret masking: {} key(s) from {files} reference file(s): {}",
+            names.len(),
+            names.join(", ")
+        ),
+    }
+}
+
 fn run() -> i32 {
     let cli = Cli::parse();
     let policy_path = expand_home(&cli.policy_path);
@@ -297,6 +316,8 @@ fn run() -> i32 {
                 }
             }
 
+            println!("{}", secret_mask_status());
+
             if !pauses.is_empty() {
                 println!("\nActive pauses:");
                 for p in &pauses {
@@ -392,10 +413,10 @@ fn run() -> i32 {
                 println!("  {} [{}]{}", rule.name, action, source);
                 println!("    tool: {}", rule.tool_pattern);
                 for cond in &rule.conditions {
-                    println!("    when: {cond}");
+                    println!("    when: {}", secret_mask::mask(cond));
                 }
                 if let Some(reason) = &rule.reason {
-                    println!("    reason: {reason}");
+                    println!("    reason: {}", secret_mask::mask(reason));
                 }
                 println!();
             }
@@ -462,7 +483,7 @@ fn run() -> i32 {
                 println!("Matched rule: (none — default action)");
             }
             if let Some(reason) = &result.reason {
-                println!("Reason:       {reason}");
+                println!("Reason:       {}", secret_mask::mask(reason));
             }
             println!("Eval time:    {}us", result.evaluation_time_us);
             0

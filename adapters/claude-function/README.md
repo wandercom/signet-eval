@@ -135,6 +135,9 @@ and non-secret structural values. It does not treat every high-entropy string,
 email address, or IP address as a secret; arbitrary secrets cannot be guaranteed
 detectable. It neither stores a secret-handle map nor reinserts credentials into
 arbitrary commands.
+With the optional `~/.signet/secret_mask.yaml` (see the top-level README), the
+same sanitizer first replaces known values from the named env files with
+`$NAME`, so prompts and tool results show the key name instead of the value.
 
 | Controlled surface | Behavior |
 | --- | --- |

@@ -428,6 +428,21 @@ pub(crate) fn evaluate_condition(
         }
     }
 
+    // contains_masked_value(parameters | field) — the original input holds the
+    // literal value of a key from the user's secret_mask reference files.
+    // Never matches when no reference file is configured. The input is not
+    // rewritten; diagnostics mask the value separately.
+    if let Some(args) = strip_fn(cond, "contains_masked_value") {
+        let field = args.trim();
+        let haystack = if field == "parameters" {
+            params_str.clone()
+        } else {
+            param_str(&call.parameters, field)
+        };
+        let known = crate::secret_mask::table();
+        return Ok(!crate::secret_mask::masked_names(&haystack, &known).is_empty());
+    }
+
     // has_current_session() — the hook host supplied an identifiable chat/session.
     // A working-directory fallback may group multiple agent windows, so callers that
     // need strict same-session evidence should require this alongside ledger recency.
@@ -563,7 +578,8 @@ pub fn evaluate(
             let reason = match (&rule.reason, &rule.alternative) {
                 (Some(r), Some(alt)) => Some(format!("{r} Instead: {alt}")),
                 (reason, _) => reason.clone(),
-            };
+            }
+            .map(|reason| substitute_masked_keys(reason, call));
 
             // Resolve Gate inline (read-only vault query, like spend_gt)
             if rule.action == Decision::Gate {
@@ -646,6 +662,28 @@ pub fn evaluate(
     }
 
     result
+}
+
+/// Placeholder in a rule reason or alternative naming the masked keys whose
+/// literal values the call contains, as `$NAME`. Never expands to a value.
+pub const MASKED_KEYS_PLACEHOLDER: &str = "{masked_keys}";
+
+fn substitute_masked_keys(reason: String, call: &ToolCall) -> String {
+    if !reason.contains(MASKED_KEYS_PLACEHOLDER) {
+        return reason;
+    }
+    let known = crate::secret_mask::table();
+    let names = crate::secret_mask::masked_names(&call.parameters.to_string(), &known);
+    let named = if names.is_empty() {
+        "the masked variable".to_string()
+    } else {
+        names
+            .iter()
+            .map(|name| format!("${name}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    reason.replace(MASKED_KEYS_PLACEHOLDER, &named)
 }
 
 /// Walk all INJECT rules independently of the auth pass. For each rule whose
@@ -1176,6 +1214,7 @@ const KNOWN_CONDITION_FNS: &[&str] = &[
     "has_credential",
     "has_recent_action",
     "has_current_session",
+    "contains_masked_value",
     "not",
     "or",
 ];
@@ -1996,6 +2035,20 @@ pub fn system_default_rules() -> Vec<PolicyRule> {
             locked: false,
             reason: Some("chmod 777 grants world-readable/writable/executable access.".into()),
             alternative: Some("Use minimum permissions: 'chmod 755' for executables, 'chmod 644' for files, 'chmod 600' for secrets.".into()),
+            gate: None, ensure: None,
+        inject: None,
+    },
+        // Masked secrets (secret_mask.yaml) show as $NAME in every log and reply.
+        // A call that still carries a literal value asks rather than denies: a
+        // command can genuinely need it. Never matches without a reference file.
+        PolicyRule {
+            name: "block_masked_secret_literal".into(),
+            tool_pattern: ".*".into(),
+            conditions: vec!["contains_masked_value(parameters)".into()],
+            action: Decision::Ask,
+            locked: false,
+            reason: Some("Tool input contains the literal value of masked secret {masked_keys}.".into()),
+            alternative: Some("Use {masked_keys} instead of the literal value.".into()),
             gate: None, ensure: None,
         inject: None,
     },
@@ -4727,8 +4780,8 @@ rules:
         let defaults = system_default_rules();
         assert_eq!(
             defaults.len(),
-            7,
-            "Should have exactly 7 universal safe defaults"
+            8,
+            "Should have exactly 8 universal safe defaults"
         );
         assert!(
             defaults.iter().all(|r| !r.locked),
@@ -5323,5 +5376,142 @@ mod inject_tests {
             "Validation errors in inject_examples.yaml: {:?}",
             errors.iter().map(|d| &d.error).collect::<Vec<_>>()
         );
+    }
+}
+
+#[cfg(test)]
+mod secret_mask_tests {
+    use super::*;
+    use crate::secret_mask::set_test_pairs;
+
+    const VALUE: &str = "synthetic-deploy-value-0042";
+
+    fn bash(command: &str) -> ToolCall {
+        ToolCall {
+            tool_name: "Bash".into(),
+            parameters: serde_json::json!({"command": command}),
+        }
+    }
+
+    fn with_pairs<T>(pairs: &[(&str, &str)], run: impl FnOnce() -> T) -> T {
+        set_test_pairs(Some(pairs));
+        let out = run();
+        set_test_pairs(None);
+        out
+    }
+
+    #[test]
+    fn contains_masked_value_reads_original_parameters_or_a_field() {
+        let call = ToolCall {
+            tool_name: "Write".into(),
+            parameters: serde_json::json!({"file_path": "/tmp/x", "content": format!("KEY={VALUE}")}),
+        };
+        let (whole, content, path) = with_pairs(&[("DEPLOY_TOKEN", VALUE)], || {
+            (
+                evaluate_condition("contains_masked_value(parameters)", &call, None),
+                evaluate_condition("contains_masked_value(content)", &call, None),
+                evaluate_condition("contains_masked_value(file_path)", &call, None),
+            )
+        });
+        assert_eq!(whole, Ok(true));
+        assert_eq!(content, Ok(true));
+        assert_eq!(path, Ok(false));
+    }
+
+    #[test]
+    fn contains_masked_value_never_matches_without_reference_values() {
+        let (cond, decision) = with_pairs(&[], || {
+            (
+                evaluate_condition("contains_masked_value(parameters)", &bash(VALUE), None),
+                evaluate(&bash(&format!("echo {VALUE}")), &default_policy(), None).decision,
+            )
+        });
+        assert_eq!(cond, Ok(false));
+        assert_eq!(decision, Decision::Allow);
+    }
+
+    #[test]
+    fn default_rule_asks_and_names_the_key_but_never_the_value() {
+        let (literal, reference) = with_pairs(&[("DEPLOY_TOKEN", VALUE)], || {
+            (
+                evaluate(
+                    &bash(&format!("curl -H 'x: {VALUE}' https://example.test")),
+                    &default_policy(),
+                    None,
+                ),
+                evaluate(
+                    &bash("curl -H \"x: $DEPLOY_TOKEN\" https://example.test"),
+                    &default_policy(),
+                    None,
+                ),
+            )
+        });
+        assert_eq!(literal.decision, Decision::Ask);
+        assert_eq!(
+            literal.matched_rule.as_deref(),
+            Some("block_masked_secret_literal")
+        );
+        let reason = literal.reason.unwrap();
+        assert!(reason.contains("$DEPLOY_TOKEN"), "{reason}");
+        assert!(
+            reason.contains("Use $DEPLOY_TOKEN instead of the literal value"),
+            "{reason}"
+        );
+        assert!(!reason.contains(VALUE), "{reason}");
+        assert!(!reason.contains(MASKED_KEYS_PLACEHOLDER));
+        assert_eq!(reference.decision, Decision::Allow);
+    }
+
+    #[test]
+    fn masking_never_changes_the_input_policy_evaluates() {
+        let policy = CompiledPolicy::from_config(
+            &serde_yaml::from_str(&format!(
+                r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: literal_match
+    tool_pattern: "^Bash$"
+    conditions: ["contains(parameters, '{VALUE}')"]
+    action: DENY
+    reason: "literal seen"
+"#
+            ))
+            .unwrap(),
+        );
+        let call = bash(&format!("echo {VALUE}"));
+        let before = call.parameters.clone();
+        let result = with_pairs(&[("DEPLOY_TOKEN", VALUE)], || {
+            evaluate(&call, &policy, None)
+        });
+        assert_eq!(result.decision, Decision::Deny);
+        assert_eq!(call.parameters, before);
+    }
+
+    #[test]
+    fn contains_masked_value_handles_escapes_and_oversized_input() {
+        let quoted = "synthetic\"quoted\\value";
+        let call = bash(&format!("{}{quoted}", "x".repeat(1024 * 1024)));
+        let (hit, miss) = with_pairs(&[("QUOTED_SECRET", quoted)], || {
+            (
+                evaluate_condition("contains_masked_value(parameters)", &call, None),
+                evaluate_condition(
+                    "contains_masked_value(parameters)",
+                    &bash("synthetic\u{0000}\"quoted\\value"),
+                    None,
+                ),
+            )
+        });
+        assert_eq!(hit, Ok(true));
+        assert_eq!(miss, Ok(false));
+    }
+
+    #[test]
+    fn validator_accepts_contains_masked_value() {
+        let config: PolicyConfig = serde_yaml::from_str(
+            "version: 1\nrules:\n  - name: r\n    tool_pattern: '.*'\n    conditions: ['contains_masked_value(parameters)']\n    action: ASK\n",
+        )
+        .unwrap();
+        assert!(validate_policy(&config).is_empty());
     }
 }

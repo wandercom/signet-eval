@@ -320,3 +320,41 @@ fn sanitizer_is_structured_and_preserves_hashes_and_result_shapes() {
     assert_eq!(response["value"]["headers"]["Cookie"], "[REDACTED]");
     assert!(!response.to_string().contains("private-canary-value"));
 }
+
+#[test]
+fn result_delivery_and_redaction_mask_configured_secrets() {
+    const VALUE: &str = "synthetic-delivery-value-0055";
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        dir.path().join("profile"),
+        format!("RESULT_TOKEN={VALUE}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("secret_mask.yaml"),
+        format!("files: [{}]\n", dir.path().join("profile").display()),
+    )
+    .unwrap();
+    let request = intent(dir.path(), "masked-delivery");
+    let admitted = invoke(dir.path(), "adjudicate", &request);
+    assert_eq!(admitted["decision"], "allow", "{admitted}");
+    let delivered = invoke(
+        dir.path(),
+        "record-result",
+        &json!({"protocol_version":1,"operation_id":"masked-delivery","receipt":admitted["receipt"],
+            "task_receipt":{"operation_id":"masked-delivery","note":format!("used {VALUE}")}}),
+    );
+    assert_eq!(delivered["status"], "recorded", "{delivered}");
+    let bytes = std::fs::read(state.join("integration.db")).unwrap();
+    let stored = String::from_utf8_lossy(&bytes);
+    assert!(!stored.contains(VALUE));
+    assert!(stored.contains("$RESULT_TOKEN"));
+    let redacted = invoke(
+        dir.path(),
+        "redact",
+        &json!({"value": format!("echo {VALUE}")}),
+    );
+    assert_eq!(redacted["value"], "echo $RESULT_TOKEN");
+}

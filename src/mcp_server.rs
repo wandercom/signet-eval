@@ -268,37 +268,45 @@ impl ServerHandler for SignetMcpServer {
             let empty = serde_json::Map::new();
             let args_map = request.arguments.as_ref().unwrap_or(&empty);
             let args = &args_map;
-            let result = match &*request.name {
-                "signet_list_rules" => handle_list_rules(),
-                "signet_add_rule" => handle_add_rule(args),
-                "signet_remove_rule" => handle_remove_rule(args),
-                "signet_set_limit" => handle_set_limit(args),
-                "signet_status" => handle_status(),
-                "signet_recent_actions" => handle_recent_actions(args),
-                "signet_store_credential" => handle_store_credential(args),
-                "signet_list_credentials" => handle_list_credentials(),
-                "signet_delete_credential" => handle_delete_credential(args),
-                "signet_validate" => handle_validate(args),
-                "signet_test" => handle_test(args),
-                "signet_condition_help" => handle_condition_help(),
-                "signet_reorder_rule" => handle_reorder_rule(args),
-                "signet_edit_rule" => handle_edit_rule(args),
-                "signet_sign_policy" => handle_sign_policy(),
-                "signet_reset_session" => handle_reset_session(),
-                "signet_use_credential" => handle_use_credential(args),
-                "signet_preflight_submit" => handle_preflight_submit(args),
-                "signet_preflight_active" => handle_preflight_active(),
-                "signet_preflight_history" => handle_preflight_history(args),
-                "signet_preflight_violations" => handle_preflight_violations(args),
-                "signet_preflight_test" => handle_preflight_test(args),
-                _ => format!("Unknown tool: {}", request.name),
-            };
+            let result = handle_tool(&request.name, args);
             Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
         }
     }
 }
 
 // === Tool Handlers ===
+
+/// Run one management tool. Every reply passes through known-secret masking,
+/// so recent actions, status, violations, rule listings and test reasons show
+/// `$NAME` instead of a masked value.
+fn handle_tool(name: &str, args: &serde_json::Map<String, Value>) -> String {
+    let result = match name {
+        "signet_list_rules" => handle_list_rules(),
+        "signet_add_rule" => handle_add_rule(args),
+        "signet_remove_rule" => handle_remove_rule(args),
+        "signet_set_limit" => handle_set_limit(args),
+        "signet_status" => handle_status(),
+        "signet_recent_actions" => handle_recent_actions(args),
+        "signet_store_credential" => handle_store_credential(args),
+        "signet_list_credentials" => handle_list_credentials(),
+        "signet_delete_credential" => handle_delete_credential(args),
+        "signet_validate" => handle_validate(args),
+        "signet_test" => handle_test(args),
+        "signet_condition_help" => handle_condition_help(),
+        "signet_reorder_rule" => handle_reorder_rule(args),
+        "signet_edit_rule" => handle_edit_rule(args),
+        "signet_sign_policy" => handle_sign_policy(),
+        "signet_reset_session" => handle_reset_session(),
+        "signet_use_credential" => handle_use_credential(args),
+        "signet_preflight_submit" => handle_preflight_submit(args),
+        "signet_preflight_active" => handle_preflight_active(),
+        "signet_preflight_history" => handle_preflight_history(args),
+        "signet_preflight_violations" => handle_preflight_violations(args),
+        "signet_preflight_test" => handle_preflight_test(args),
+        _ => format!("Unknown tool: {name}"),
+    };
+    crate::secret_mask::mask(&result)
+}
 
 fn handle_list_rules() -> String {
     let config = load_policy_effective();
@@ -556,6 +564,13 @@ fn handle_status() -> String {
         config.rules.len(),
         config.default_action
     )];
+    lines.push(match crate::secret_mask::summary() {
+        None => "Secret masking: off".into(),
+        Some((names, files)) => format!(
+            "Secret masking: {} key(s) from {files} reference file(s)",
+            names.len()
+        ),
+    });
     if !vault::vault_exists() {
         lines.push("Vault: not set up (run: signet-eval setup)".into());
         return lines.join("\n");
@@ -977,6 +992,10 @@ fn handle_condition_help() -> String {
   param_contains(field, 'substr')      — parameter field contains substring
   matches(field, 'regex')              — parameter field matches regex pattern
   matches(agent_model, '^claude-opus-') — host-reported issuing model (hook mode; absent if the host sends none)
+  contains_masked_value(parameters)    — tool input holds a literal value from secret_mask.yaml
+                                         reference files (also takes a field name; never
+                                         matches without a config). Reasons can say
+                                         {masked_keys}, which names the keys as $NAME.
   has_credential('name')               — credential exists in vault
   spend_gt('category', limit)          — session spend > limit
   spend_plus_amount_gt('cat', field, limit) — session spend + param > limit
@@ -993,6 +1012,7 @@ Examples:
   Block large purchases: param_gt(amount, 500)
   Block IP access:       matches(host, '^\d+\.\d+\.\d+\.\d+$')
   Opus-only gcloud:      contains(parameters, 'gcloud') + not(matches(agent_model, '^claude-opus-'))
+  Literal secret:        contains_masked_value(parameters)  (default rule block_masked_secret_literal asks)
 
 Action Types:
   ALLOW   — permit the tool call
@@ -1339,4 +1359,29 @@ pub async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     let service = rmcp::serve_server(server, rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod secret_mask_tests {
+    use super::*;
+
+    #[test]
+    fn management_replies_show_masked_names_not_values() {
+        crate::secret_mask::set_test_pairs(Some(&[("RELEASE_TOKEN", "synthetic-release-value")]));
+        let args = serde_json::json!({"constraints": [{
+            "name": "no_release",
+            "tool_pattern": "^Bash$",
+            "conditions": ["contains(parameters, 'synthetic-release-value')"],
+            "action": "DENY",
+            "reason": "blocked synthetic-release-value",
+            "alternative": "use synthetic-release-value elsewhere"
+        }]});
+        let tested = handle_tool("signet_preflight_test", args.as_object().unwrap());
+        let unknown = handle_tool("synthetic-release-value", &serde_json::Map::new());
+        crate::secret_mask::set_test_pairs(None);
+        for reply in [&tested, &unknown] {
+            assert!(!reply.contains("synthetic-release-value"), "{reply}");
+            assert!(reply.contains("$RELEASE_TOKEN"), "{reply}");
+        }
+    }
 }
