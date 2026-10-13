@@ -59,7 +59,8 @@ Existing settings and previous plugin files are retained under the Claude config
 directory's `signet-adapter-backups`; restore both to roll back. Restart Claude.
 
 Installing the adapter does **not** enable enforcement: global/session disabled
-state is preserved. When globally disabled, the installed plugin is neutral.
+state is preserved. When globally disabled, the installed plugin turns policy off
+but keeps prompt and tool-output redaction, and never blocks.
 Other clients' settings are not touched. Default hook mode remains legacy until
 this explicit installation command is run. An older Signet binary without the
 integration protocol must be upgraded before selecting modern Kindex coexistence;
@@ -80,8 +81,10 @@ working directory and requests a fresh owner description. This works when
 `session.start` was skipped, including hot reload and resumed sessions; startup
 failure is reported but never stored as a permanent conflict. The adapter checks
 protocol version 1 and owner `signet-eval` before trusting any description.
-Confirmed disabled state delegates neutrally even if the adapter revision is stale
-or legacy handlers remain. Active state requires the matching adapter revision
+Confirmed disabled state skips policy even if the adapter revision is stale or
+legacy handlers remain. Redaction still runs; if the sanitizer fails while
+disabled, the original prompt or result is delivered with a warning rather than
+withheld, so disabling remains a recovery path. Active state requires the matching adapter revision
 and zero detected legacy handlers on every callback.
 
 Missing binaries, malformed replies, invalid policy, paused enforcement and
@@ -99,7 +102,7 @@ the adapter displays the failure and still attempts the vault-independent
 sanitizer. If sanitation also fails, it forwards the original prompt with an
 explicit warning that Signet redaction is unavailable. This is an availability
 tradeoff for recovery prompts; avoid entering secrets while that warning is
-present. Confirmed disabled state forwards the original prompt neutrally.
+present. Confirmed disabled state still sanitizes the prompt.
 
 Before each policy evaluation the adapter asks the host for `$.session.model()`
 and, when the answer is a string, passes it as the envelope `model`. Policy
@@ -147,7 +150,7 @@ same sanitizer first replaces known values from the named env files with
 | Admission ledger | Store input/scope digests and receipts, never raw task arguments |
 | Reported task outcomes | Sanitize before persistence; keep original digest as evidence binding |
 | Function `prompt.submit` | Sanitize model/main-transcript prompt projection when available; warn and preserve recovery prompts if sanitation fails |
-| Function `tool.call` | Replace successful result with a fresh sanitized, host-validated result; return safe error text on failed calls |
+| Function `tool.call` | Replace successful result with a fresh sanitized, host-validated result; return safe error text on failed calls. Also while policy is disabled, where a sanitizer failure returns the original result with a warning instead of withholding it |
 
 This is **not all-log or all-transcript protection**. The tested Claude path writes
 the original prompt to a queue/enqueue transcript row before `prompt.submit`.

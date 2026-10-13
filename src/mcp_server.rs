@@ -996,6 +996,9 @@ fn handle_condition_help() -> String {
                                          reference files (also takes a field name; never
                                          matches without a config). Reasons can say
                                          {masked_keys}, which names the keys as $NAME.
+  reads_secret_file()                  — a command or path field names a secret_mask
+                                         reference file other than via source/.
+                                         (locked rule protect_secret_reference_files)
   has_credential('name')               — credential exists in vault
   spend_gt('category', limit)          — session spend > limit
   spend_plus_amount_gt('cat', field, limit) — session spend + param > limit

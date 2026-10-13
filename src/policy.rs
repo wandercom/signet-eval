@@ -297,6 +297,9 @@ pub(crate) fn evaluate_condition(
     if cond == "protected_binary_reference()" {
         return Ok(protected_binary_reference(call));
     }
+    if cond == "reads_secret_file()" {
+        return Ok(reads_secret_file(call));
+    }
     let params_str = call.parameters.to_string();
 
     // contains(parameters, 'substring')
@@ -1208,6 +1211,7 @@ const KNOWN_CONDITION_FNS: &[&str] = &[
     "param_contains",
     "matches",
     "protected_binary_reference",
+    "reads_secret_file",
     "spend_gt",
     "spend_plus_amount_gt",
     "any_of",
@@ -1791,6 +1795,163 @@ fn protected_binary_reference(call: &ToolCall) -> bool {
     })
 }
 
+/// Whether a command or path field of the tool input names a secret_mask
+/// reference file other than as the operand of `source FILE` or `. FILE`.
+/// Content being written, prompts and descriptions are not inspected, so a
+/// document may mention the file. Lexical, like protected_binary_reference: it
+/// catches the accidental `cat ~/.profile`, not a deliberate evasion through
+/// globs, symlinks or copies. False when masking is off.
+fn reads_secret_file(call: &ToolCall) -> bool {
+    let files = crate::secret_mask::reference_files();
+    if files.is_empty() {
+        return false;
+    }
+    let home = std::env::var("HOME").ok().filter(|home| !home.is_empty());
+    let cwd = ["cwd", "workdir"]
+        .iter()
+        .find_map(|field| {
+            call.parameters
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|cwd| !cwd.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok());
+    let mut texts = Vec::new();
+    collect_action_strings(&call.parameters, &mut texts);
+    texts.iter().any(|text| {
+        files
+            .iter()
+            .any(|file| mentions_reference_file(text, file, home.as_deref(), cwd.as_deref()))
+    })
+}
+
+/// Fields that run a command or name a file, across hook adapters.
+const ACTION_FIELDS: &[&str] = &[
+    "command",
+    "cmd",
+    "CommandLine",
+    "args",
+    "argv",
+    "file_path",
+    "filePath",
+    "path",
+    "paths",
+    "notebook_path",
+    "target_file",
+    "TargetFile",
+    "AbsolutePath",
+    "file",
+    "files",
+    "filename",
+    "cwd",
+    "workdir",
+];
+/// Patch bodies: only their file headers name files.
+const PATCH_FIELDS: &[&str] = &["input", "patch"];
+
+fn collect_action_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .for_each(|item| collect_action_strings(item, out)),
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                if ACTION_FIELDS.contains(&key.as_str()) {
+                    collect_strings(item, out);
+                } else if let (true, Some(patch)) =
+                    (PATCH_FIELDS.contains(&key.as_str()), item.as_str())
+                {
+                    out.extend(patch.lines().filter_map(|line| {
+                        [
+                            "*** Add File: ",
+                            "*** Update File: ",
+                            "*** Delete File: ",
+                            "*** Move to: ",
+                        ]
+                        .iter()
+                        .find_map(|header| line.strip_prefix(header))
+                    }));
+                } else {
+                    collect_action_strings(item, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_strings<'a>(value: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match value {
+        serde_json::Value::String(text) => out.push(text),
+        serde_json::Value::Array(items) => items.iter().for_each(|item| collect_strings(item, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|item| collect_strings(item, out)),
+        _ => {}
+    }
+}
+
+/// `file` named by its absolute path, a `~`/`$HOME` spelling, or its bare name
+/// when the command runs in (or changes to) its directory.
+fn mentions_reference_file(
+    text: &str,
+    file: &std::path::Path,
+    home: Option<&str>,
+    cwd: Option<&std::path::Path>,
+) -> bool {
+    let (Some(full), Some(name)) = (file.to_str(), file.file_name().and_then(|n| n.to_str()))
+    else {
+        return false;
+    };
+    let parent = file.parent().and_then(|p| p.to_str()).unwrap_or("");
+    let mut paths = vec![regex::escape(full)];
+    let mut dirs = vec![regex::escape(parent)];
+    if let Some(home) = home.map(|home| home.trim_end_matches('/')) {
+        if let Some(rest) = full
+            .strip_prefix(home)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            let rest = regex::escape(rest);
+            paths.push(format!(r#"(?:~|"?\$HOME"?|"?\$\{{HOME\}}"?)/{rest}"#));
+        }
+        if parent == home {
+            dirs.push(r"~|\$HOME|\$\{HOME\}".into());
+        }
+    }
+    let before = r#"(?:^|[\s'"=<>;|&(:,])"#;
+    let after = r#"(?:$|[\s'"<>;|&),])"#;
+    let path = format!("(?:{})", paths.join("|"));
+    let bare = format!(r"(?:\./)?{}", regex::escape(name));
+    let in_dir = cwd.is_some_and(|cwd| cwd == std::path::Path::new(parent));
+    let named = format!("(?:{path}|{bare})");
+    // `source FILE` and `. FILE` load values without printing them.
+    let Ok(sourced) = Regex::new(&format!(
+        r#"(?i)(^|[;&|(\n'"]|\bthen\b|\bdo\b|\belse\b)\s*(?:source|\.)\s+["']?{named}["']?{after}"#
+    )) else {
+        return true;
+    };
+    let rest = sourced.replace_all(text, "$1 ");
+    let Ok(direct) = Regex::new(&format!("(?i){before}{path}{after}")) else {
+        return true;
+    };
+    if direct.is_match(&rest) {
+        return true;
+    }
+    let Ok(relative) = Regex::new(&format!("(?i){before}{bare}{after}")) else {
+        return true;
+    };
+    if !relative.is_match(&rest) {
+        return false;
+    }
+    // A bare name counts in the file's directory: the working directory, or
+    // one the command changes to.
+    let dirs = dirs.join("|");
+    in_dir
+        || Regex::new(&format!(
+            r#"(?i)\bcd(?:\s+["']?(?:{dirs})/?["']?)?\s*(?:$|[;&|)\n])"#
+        ))
+        .map_or(true, |cd| cd.is_match(&rest))
+}
+
 /// Self-protection rules that ship locked in every default policy.
 /// These prevent an AI agent from disabling its own policy enforcement.
 pub fn self_protection_rules() -> Vec<PolicyRule> {
@@ -1894,6 +2055,20 @@ pub fn self_protection_rules() -> Vec<PolicyRule> {
             locked: true,
             reason: Some("Self-protection: preflight records are tamper-protected.".into()),
             alternative: Some("Use signet_preflight_active or signet_preflight_violations to read your preflight data.".into()),
+            gate: None, ensure: None,
+        inject: None,
+    },
+        // A secret_mask reference file holds live values. Anything that reads it
+        // puts them in the transcript and the model provider's logs; output
+        // redaction exists only on some hosts. Sourcing it prints nothing.
+        PolicyRule {
+            name: "protect_secret_reference_files".into(),
+            tool_pattern: ".*".into(),
+            conditions: vec!["reads_secret_file()".into()],
+            action: Decision::Deny,
+            locked: true,
+            reason: Some("Secret reference file: reading it would put live secret values in the transcript.".into()),
+            alternative: Some("Load it without printing, then use the variable by name: `source ~/.profile && cmd --token \"$NAME\"`. To check that a key exists: `source ~/.profile && [ -n \"$NAME\" ] && echo set`. Ask the user for key names, never values.".into()),
             gate: None, ensure: None,
         inject: None,
     },
@@ -2944,7 +3119,7 @@ mod self_protection_tests {
     #[test]
     fn test_default_policy_has_locked_rules() {
         let rules = self_protection_rules();
-        assert_eq!(rules.len(), 10);
+        assert_eq!(rules.len(), 11);
         assert!(rules.iter().all(|r| r.locked));
         assert!(rules
             .iter()
@@ -5513,5 +5688,169 @@ rules:
         )
         .unwrap();
         assert!(validate_policy(&config).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    use super::*;
+    use crate::secret_mask::set_test_files;
+    use std::path::Path;
+
+    const HOME: &str = "/home/u";
+    const PROFILE: &str = "/home/u/.profile";
+
+    fn mentions(text: &str, cwd: &str) -> bool {
+        mentions_reference_file(text, Path::new(PROFILE), Some(HOME), Some(Path::new(cwd)))
+    }
+
+    #[test]
+    fn reads_by_any_spelling_are_detected() {
+        for text in [
+            "cat ~/.profile",
+            "sed -E 's/^export //' ~/.profile",
+            "grep -c KEY $HOME/.profile",
+            r#"head "$HOME"/.profile"#,
+            "awk -F= '{print $1}' ${HOME}/.profile",
+            "/home/u/.profile",
+            "cp ~/.PROFILE /tmp/p && cat /tmp/p",
+            "source ~/.profile; cat ~/.profile",
+            "bash -c 'cat ~/.profile'",
+        ] {
+            assert!(mentions(text, "/repo"), "{text}");
+        }
+    }
+
+    #[test]
+    fn bare_name_counts_only_in_its_directory() {
+        assert!(mentions("cat .profile", HOME));
+        assert!(mentions("cat ./.profile", HOME));
+        assert!(mentions("cd ~ && cat .profile", "/repo"));
+        assert!(mentions("cd && grep KEY .profile", "/repo"));
+        assert!(!mentions("cat .profile", "/repo"));
+        assert!(!mentions("cd ~/Code && cat .profile", "/repo"));
+        assert!(!mentions("cat ~/Code/x/.profile", "/repo"));
+    }
+
+    #[test]
+    fn sourcing_and_unrelated_paths_are_allowed() {
+        for text in [
+            "source ~/.profile && gh api user",
+            ". ~/.profile && curl -H \"Authorization: Bearer $GITHUB_TOKEN\" x",
+            "bash -lc 'source $HOME/.profile && npm whoami'",
+            "if true; then . ~/.profile; fi",
+            "ls ~/.profile.d",
+            "cat ~/.profile_backup_notes.md",
+            "echo done",
+        ] {
+            assert!(!mentions(text, "/repo"), "{text}");
+        }
+        assert!(!mentions("source .profile && make", HOME));
+    }
+
+    #[test]
+    fn locked_rule_denies_reads_and_allows_sourcing() {
+        set_test_files(Some(&[PROFILE]));
+        let policy = default_policy();
+        let read = ToolCall {
+            tool_name: "Read".into(),
+            parameters: serde_json::json!({"file_path": PROFILE}),
+        };
+        let cat = ToolCall {
+            tool_name: "Bash".into(),
+            parameters: serde_json::json!({"command": format!("cat {PROFILE} | head")}),
+        };
+        let source = ToolCall {
+            tool_name: "Bash".into(),
+            parameters: serde_json::json!({"command": format!("source {PROFILE} && gh api user")}),
+        };
+        let (read, cat, source) = (
+            evaluate(&read, &policy, None),
+            evaluate(&cat, &policy, None),
+            evaluate(&source, &policy, None),
+        );
+        set_test_files(None);
+        for result in [&read, &cat] {
+            assert_eq!(result.decision, Decision::Deny);
+            assert!(result.matched_locked);
+            assert_eq!(
+                result.matched_rule.as_deref(),
+                Some("protect_secret_reference_files")
+            );
+        }
+        assert_ne!(
+            source.matched_rule.as_deref(),
+            Some("protect_secret_reference_files")
+        );
+    }
+
+    #[test]
+    fn only_command_and_path_fields_count() {
+        set_test_files(Some(&[PROFILE]));
+        let check = |tool: &str, parameters: serde_json::Value| {
+            evaluate_condition(
+                "reads_secret_file()",
+                &ToolCall {
+                    tool_name: tool.into(),
+                    parameters,
+                },
+                None,
+            )
+            .unwrap()
+        };
+        let results = [
+            check(
+                "Write",
+                serde_json::json!({"file_path": "/repo/README.md", "content": format!("keys live in {PROFILE} here")}),
+            ),
+            check(
+                "Bash",
+                serde_json::json!({"command": "ls", "description": format!("never cat {PROFILE} ")}),
+            ),
+            check(
+                "Agent",
+                serde_json::json!({"prompt": format!("do not read {PROFILE} ")}),
+            ),
+            check(
+                "Edit",
+                serde_json::json!({"file_path": PROFILE, "old_string": "a", "new_string": "b"}),
+            ),
+            check(
+                "exec_command",
+                serde_json::json!({"cmd": ["bash", "-lc", format!("cat {PROFILE}")]}),
+            ),
+            check(
+                "apply_patch",
+                serde_json::json!({"input": format!("*** Begin Patch\n*** Update File: {PROFILE}\n@@\n-a\n+b\n*** End Patch")}),
+            ),
+            check(
+                "apply_patch",
+                serde_json::json!({"input": format!("*** Begin Patch\n*** Update File: /repo/doc.md\n+run cat {PROFILE} first\n*** End Patch")}),
+            ),
+            check(
+                "mcp__fs__read",
+                serde_json::json!({"args": {"path": PROFILE}}),
+            ),
+        ];
+        set_test_files(None);
+        assert_eq!(
+            results,
+            [false, false, false, true, true, true, false, true]
+        );
+    }
+
+    #[test]
+    fn nothing_is_protected_without_reference_files() {
+        set_test_files(Some(&[]));
+        let hit = evaluate_condition(
+            "reads_secret_file()",
+            &ToolCall {
+                tool_name: "Bash".into(),
+                parameters: serde_json::json!({"command": "cat ~/.profile"}),
+            },
+            None,
+        );
+        set_test_files(None);
+        assert_eq!(hit, Ok(false));
     }
 }
