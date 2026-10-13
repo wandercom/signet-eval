@@ -1,5 +1,4 @@
 mod claude_install;
-mod embedded_checks;
 mod hook;
 mod integration;
 mod policy;
@@ -32,7 +31,7 @@ struct Cli {
     #[arg(long, default_value = "~/.signet/rules.yaml")]
     rules_path: String,
 
-    /// Hook protocol adapter: claude, codex, codex-permission, antigravity, or opencode
+    /// Hook protocol adapter: claude, codex, codex-permission, antigravity, opencode, cursor, or muse
     #[arg(long, default_value = "claude")]
     adapter: String,
 }
@@ -354,7 +353,7 @@ fn run() -> i32 {
             }
         },
         Some(Command::Rules) => {
-            let system_config = match policy::load_policy_config(&policy_path) {
+            let system_config = match policy::load_effective_policy_config(&policy_path) {
                 Ok(config) => config,
                 Err(e) => {
                     eprintln!("Error loading system policy: {e}");
@@ -568,7 +567,7 @@ fn run() -> i32 {
             match policy::load_policy_config(&policy_path) {
                 Ok(mut config) => {
                     if fix {
-                        let result = policy::fix_policy(&mut config);
+                        let result = policy::fix_system_policy(&mut config);
                         if result.rules_removed.is_empty() && result.rules_modified.is_empty() {
                             println!("No auto-fixable issues found.");
                         } else {
@@ -598,7 +597,7 @@ fn run() -> i32 {
                             }
                         }
                     } else {
-                        let diagnostics = policy::validate_policy(&config);
+                        let diagnostics = policy::validate_system_policy(&config);
                         let errors: Vec<_> = diagnostics
                             .iter()
                             .filter(|d| d.severity == policy::DiagnosticSeverity::Error)
@@ -752,7 +751,7 @@ fn run() -> i32 {
                 // Validate rule name exists if specified
                 if let Some(ref rule_name) = rule {
                     // Check merged policy (system + user rules) for rule name
-                    let system_rules = policy::load_policy_config(&policy_path)
+                    let system_rules = policy::load_effective_policy_config(&policy_path)
                         .map(|c| c.rules)
                         .unwrap_or_default();
                     let user_rules = policy::load_rules(&rules_path);

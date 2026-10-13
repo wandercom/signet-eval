@@ -14,6 +14,8 @@ echo '{"tool_name":"Bash","tool_input":{"command":"rm foo"}}' | signet-eval
 echo '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"rm foo"}}' | signet-eval --adapter codex
 echo '{"hook_event_name":"PermissionRequest","tool_name":"Bash","tool_input":{"command":"rm foo"}}' | signet-eval --adapter codex-permission
 echo '{"toolCall":{"name":"run_command","args":{"CommandLine":"rm foo","Cwd":"/tmp"}}}' | signet-eval --adapter antigravity
+echo '{"hook_event_name":"beforeShellExecution","command":"rm foo","cwd":"/tmp"}' | signet-eval --adapter cursor
+echo '{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":"rm foo"}}' | signet-eval --adapter muse
 
 # CLI
 signet-eval init               # write system policy + sample.yaml (never touches rules.yaml)
@@ -40,11 +42,10 @@ signet-eval proxy              # MCP proxy
 
 ```
 src/
-  embedded_checks.rs — trusted ENSURE scripts installed atomically on first use
   main.rs          — CLI entry point (clap), 24 subcommands
   policy.rs        — Policy engine, condition functions, first-match-wins auth + advisory inject pass
   vault.rs         — Encrypted vault (Argon2id + AES-256-GCM), 3-tier, spending ledger, scoped credentials
-  hook.rs          — Claude/Codex/Antigravity/OpenCode hook I/O adapters (stdin JSON → stdout JSON)
+  hook.rs          — Claude/Codex/Antigravity/OpenCode/Cursor/Muse hook I/O adapters (stdin JSON → stdout JSON)
   integration.rs   — versioned Kindex task admission, receipt ledger, read-only capability report
   claude_install.rs — explicit embedded-adapter installation; exact retirement, backups, no enforcement enablement
   redaction.rs     — pure sanitizer shared by diagnostic persistence and optional host projections
@@ -81,7 +82,7 @@ examples/
 - **Policy HMAC integrity**: `signet-eval sign` writes HMAC sidecars for both policy.yaml and rules.yaml, verified on every hook eval when vault exists. MCP mutations auto-sign after every change.
 - **Tier 3 credentials** use compartment key (separate from session key, derived via HKDF)
 - **Scoped credential access**: `request_capability()` enforces domain, purpose, amount cap, and one-time constraints
-- **No NLP or eval() in core authorization** — regex and string comparison only. `ENSURE` may run a trusted external check (including the shipped GitHub identity check), and `INJECT` may run allowlisted commands for advisory payloads.
+- **No NLP or eval() in core authorization** — regex and string comparison only. `ENSURE` may run a trusted external check, and `INJECT` may run allowlisted commands for advisory payloads.
 
 ## Condition Functions
 
@@ -104,7 +105,7 @@ Test modules:
 - `policy::self_protection_tests` — locked rules, self-protection coverage (13 tests)
 - `policy::goodhart_tests` — adversarial: unicode homoglyphs, null bytes, 1MB inputs, SQL injection, 1000-rule performance
 - `vault::tests` — crypto, credentials, spending, device key, HMAC, brute-force
-- `tests/integration_hook.rs` — subprocess e2e: Claude/Codex/Antigravity/OpenCode hook I/O, self-protection, performance
+- `tests/integration_hook.rs` — subprocess e2e: Claude/Codex/Antigravity/OpenCode/Cursor/Muse hook I/O, self-protection, performance
 - `tests/integration_cli.rs` — CLI subcommand tests
 
 ## Conventions
@@ -112,7 +113,7 @@ Test modules:
 - Rust 2021 edition, stable toolchain
 - No unsafe code
 - All errors handled — no unwrap() on user input paths
-- Exit code always 0 in hook mode (non-zero = hook failure in Claude Code; Codex PreToolUse also accepts exit 2, but signet-eval uses JSON)
+- Exit code always 0 in hook mode (non-zero = hook failure in Claude Code; Codex PreToolUse also accepts exit 2, but signet-eval uses JSON). Cursor fails open on non-zero exits unless the hook entry sets `failClosed: true`; Muse always fails open on hook failure
 - Policy evaluation deterministic and side-effect-free
 - `INJECT` is the only non-deterministic behavior and is scoped to advisory context output
 - `locked: false` is not serialized to YAML (skip_serializing_if)

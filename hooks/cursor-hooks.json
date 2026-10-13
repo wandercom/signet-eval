@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "command": "/bin/bash -lc 'source ~/.profile >/dev/null 2>&1 || true; exec signet-eval --adapter cursor'",
+        "matcher": "^(?!Shell$|MCP:)",
+        "timeout": 30,
+        "failClosed": true
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "/bin/bash -lc 'source ~/.profile >/dev/null 2>&1 || true; exec signet-eval --adapter cursor'",
+        "timeout": 30,
+        "failClosed": true
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "/bin/bash -lc 'source ~/.profile >/dev/null 2>&1 || true; exec signet-eval --adapter cursor'",
+        "timeout": 30,
+        "failClosed": true
+      }
+    ]
+  }
+}

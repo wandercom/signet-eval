@@ -81,252 +81,6 @@ fn test_hook_asks_force_push() {
     assert_eq!(parse_decision(&out), "ask");
 }
 
-fn run_identity_hook(input: &str) -> (tempfile::TempDir, String, i32) {
-    run_identity_hook_with_env(input, &[])
-}
-
-fn run_identity_hook_with_env(
-    input: &str,
-    extra_env: &[(&str, &str)],
-) -> (tempfile::TempDir, String, i32) {
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("home");
-    let shim_dir = home.join(".gh-shim");
-    let fake_bin = dir.path().join("bin");
-    let state_dir = dir.path().join("state");
-    let repository = dir.path().join("repository");
-    std::fs::create_dir_all(&shim_dir).unwrap();
-    std::fs::create_dir_all(&fake_bin).unwrap();
-    std::fs::create_dir(&repository).unwrap();
-    // The identity being verified belongs to this fixture, independent of the
-    // source checkout's owner, local email, and the developer's global config.
-    for args in [
-        vec!["init", "-q"],
-        vec![
-            "remote",
-            "add",
-            "origin",
-            "https://github.com/jmcentire/example.git",
-        ],
-        vec!["config", "user.email", "jandrewmcentire@gmail.com"],
-    ] {
-        assert!(Command::new("git")
-            .args(args)
-            .current_dir(&repository)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .status()
-            .unwrap()
-            .success());
-    }
-
-    let shim = shim_dir.join("gh");
-    std::fs::write(&shim, "#!/bin/sh\nexit 99\n").unwrap();
-    let fake_gh = fake_bin.join("gh");
-    std::fs::write(
-        &fake_gh,
-        r#"#!/bin/sh
-if [ -n "${FAKE_GH_LOG:-}" ]; then
-  printf 'command=%s\n' "${SIGNET_TOOL_COMMAND:-}" >> "$FAKE_GH_LOG"
-  printf 'cwd=%s\n' "${SIGNET_TOOL_CWD:-}" >> "$FAKE_GH_LOG"
-  printf '%s\n' "$*" >> "$FAKE_GH_LOG"
-fi
-if [ "$1 $2 $3 $4" = "auth token --user jmcentire" ]; then
-  printf 'token-jmcentire\n'
-  exit 0
-fi
-if [ "$1 $2 $3" = "api user -q" ] && [ "$4" = ".login" ]; then
-  if [ "${GH_TOKEN:-}" = "token-wander" ]; then
-    printf 'jmc-wander\n'
-  else
-    printf 'jmcentire\n'
-  fi
-  exit 0
-fi
-exit 1
-"#,
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let path = format!(
-        "{}:{}:/usr/bin:/bin",
-        shim_dir.display(),
-        fake_bin.display()
-    );
-    let missing_policy = dir.path().join("missing-policy.yaml");
-    let missing_rules = dir.path().join("missing-rules.yaml");
-    let mut command = Command::new(env!(concat!("CARGO_BIN_EXE_", "signet", "-", "eval")));
-    command
-        .args([
-            "--policy-path",
-            missing_policy.to_str().unwrap(),
-            "--rules-path",
-            missing_rules.to_str().unwrap(),
-        ])
-        .env("HOME", &home)
-        .env("PATH", path)
-        .env("SIGNET_DIR", &state_dir)
-        .env("FAKE_GH_LOG", state_dir.join("fake-gh.log"))
-        .env_remove("GH_AS")
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .current_dir(&repository)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    for (key, value) in extra_env {
-        command.env(key, value);
-    }
-    let mut child = command.spawn().expect("failed to start permissions hook");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    (
-        dir,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        output.status.code().unwrap_or(-1),
-    )
-}
-
-#[test]
-fn test_hook_installs_identity_check_before_allowing_git_push() {
-    let (dir, out, code) = run_identity_hook(
-        r#"{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "allow", "output: {out}");
-    let installed = dir
-        .path()
-        .join("state")
-        .join("checks")
-        .join("gh-identity-matches-remote");
-    assert!(
-        installed.is_file(),
-        "built-in identity check was not installed"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        assert_ne!(
-            std::fs::metadata(installed).unwrap().permissions().mode() & 0o100,
-            0
-        );
-    }
-}
-
-#[test]
-fn test_hook_identity_check_uses_explicit_target_not_current_checkout() {
-    let (_dir, out, code) = run_identity_hook(
-        r#"{"tool_name":"Bash","tool_input":{"command":"git clone https://github.com/wandercom/example.git"}}"#,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "deny", "output: {out}");
-    assert!(out.contains("jmc-wander"), "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_uses_git_c_and_named_remote() {
-    let target = tempfile::tempdir().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .arg(target.path())
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args(["-C"])
-        .arg(target.path())
-        .args([
-            "remote",
-            "add",
-            "upstream",
-            "https://github.com/wandercom/example.git",
-        ])
-        .status()
-        .unwrap()
-        .success());
-    let command = format!("git -C {} fetch upstream", target.path().display());
-    let input = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": { "command": command },
-    })
-    .to_string();
-
-    let (dir, out, code) = run_identity_hook(&input);
-    let gh_log = std::fs::read_to_string(dir.path().join("state/fake-gh.log"))
-        .unwrap_or_else(|_| "<no gh calls>".into());
-    assert_eq!(code, 0);
-    assert_eq!(
-        parse_decision(&out),
-        "deny",
-        "output: {out}; gh calls: {gh_log}"
-    );
-    assert!(out.contains("jmc-wander"), "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_understands_full_github_api_urls() {
-    let (_dir, out, code) = run_identity_hook(
-        r#"{"tool_name":"Bash","tool_input":{"command":"gh api https://api.github.com/repos/wandercom/example"}}"#,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "deny", "output: {out}");
-    assert!(out.contains("jmc-wander"), "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_does_not_treat_gh_argument_as_git_operation() {
-    let target = tempfile::tempdir().unwrap();
-    assert!(Command::new("git")
-        .args(["init", "-q"])
-        .arg(target.path())
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args(["-C"])
-        .arg(target.path())
-        .args(["config", "user.email", "jeremy@wander.com"])
-        .status()
-        .unwrap()
-        .success());
-    let input = serde_json::json!({
-        "tool_name": "Bash",
-        "tool_input": {
-            "command": "gh workflow run push --repo jmcentire/example",
-            "workdir": target.path(),
-        },
-    })
-    .to_string();
-
-    let (_dir, out, code) = run_identity_hook(&input);
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "allow", "output: {out}");
-}
-
-#[test]
-fn test_hook_identity_check_rejects_conflicting_inherited_github_token() {
-    let (_dir, out, code) = run_identity_hook_with_env(
-        r#"{"tool_name":"Bash","tool_input":{"command":"git push origin main"}}"#,
-        &[("GITHUB_TOKEN", "token-wander")],
-    );
-    assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "deny", "output: {out}");
-    assert!(out.contains("inherited GITHUB_TOKEN"), "output: {out}");
-}
-
 #[test]
 fn test_hook_denies_piped_exec() {
     let (out, code) = run_hook(
@@ -701,6 +455,445 @@ fn test_antigravity_malformed_input_denies_with_json() {
     assert!(output["reason"].as_str().unwrap().contains("Malformed"));
 }
 
+// --- Cursor adapter (payloads follow cursor-agent 2026.10.01-e373342) ---
+
+fn cursor_output(out: &str) -> serde_json::Value {
+    let output: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(output.get("hookSpecificOutput").is_none());
+    output
+}
+
+#[test]
+fn test_cursor_pretooluse_shell_maps_to_bash_and_denies_rm() {
+    let (out, code) = run_hook_with_args(
+        r#"{"conversation_id":"0b9f6a2e-5d0e-4c43-9a4f-0c7c1c1e8d11","generation_id":"7f1d","model":"composer-2","session_id":"0b9f6a2e-5d0e-4c43-9a4f-0c7c1c1e8d11","hook_event_name":"preToolUse","cursor_version":"2026.10.01-e373342","workspace_roots":["/tmp/ws"],"user_email":null,"transcript_path":null,"tool_name":"Shell","tool_input":{"command":"rm -rf /tmp/x","cwd":"/tmp/ws"},"tool_use_id":"tool_1","cwd":"/tmp/ws"}"#,
+        &["--adapter", "cursor"],
+    );
+    assert_eq!(code, 0);
+
+    let output = cursor_output(&out);
+    assert_eq!(output["permission"], "deny");
+    assert!(output["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("File deletion blocked"));
+    assert!(output["agent_message"]
+        .as_str()
+        .unwrap()
+        .contains("File deletion blocked"));
+}
+
+#[test]
+fn test_cursor_pretooluse_allow_is_explicit() {
+    // Empty stdout is a failed hook in Cursor, so allow must be stated.
+    let (out, code) = run_hook_with_args(
+        r#"{"conversation_id":"c1","hook_event_name":"preToolUse","tool_name":"Shell","tool_input":{"command":"ls -la","cwd":"/tmp"},"tool_use_id":"t"}"#,
+        &["--adapter", "cursor"],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(
+        cursor_output(&out),
+        serde_json::json!({"permission": "allow"})
+    );
+}
+
+#[test]
+fn test_cursor_pretooluse_ask_maps_to_deny() {
+    let (out, code) = run_hook_with_args(
+        r#"{"conversation_id":"c1","hook_event_name":"preToolUse","tool_name":"Shell","tool_input":{"command":"git push --force origin main","cwd":"/tmp"}}"#,
+        &["--adapter", "cursor"],
+    );
+    assert_eq!(code, 0);
+
+    let output = cursor_output(&out);
+    assert_eq!(output["permission"], "deny");
+    assert!(output["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("Force push"));
+}
+
+#[test]
+fn test_cursor_pretooluse_write_and_delete_map_to_file_rules() {
+    let (out, _) = run_hook_with_args(
+        r#"{"conversation_id":"c1","hook_event_name":"preToolUse","tool_name":"Write","tool_input":{"file_path":"/app/.env","content":"SECRET=x"}}"#,
+        &["--adapter", "cursor"],
+    );
+    assert_eq!(cursor_output(&out)["permission"], "deny");
+
+    let (out, _) = run_hook_with_args(
+        r#"{"conversation_id":"c1","hook_event_name":"preToolUse","tool_name":"Delete","tool_input":{"file_path":"/tmp/ws/src/main.rs"}}"#,
+        &["--adapter", "cursor"],
+    );
+    let output = cursor_output(&out);
+    assert_eq!(output["permission"], "deny");
+    assert!(output["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("File deletion blocked"));
+}
+
+#[test]
+fn test_cursor_live_before_shell_execution_payload() {
+    // Captured from a live cursor-agent 2026.10.01 session (identity fields redacted).
+    let (out, code) = run_hook_with_args(
+        r#"{"conversation_id":"c9fae782-d30c-4808-898b-cc60c9eaf992","generation_id":"c9fae782-d30c-4808-898b-cc60c9eaf992","model":"grok-4.7","command":"rm -rf build","cwd":"","sandbox":false,"session_id":"c9fae782-d30c-4808-898b-cc60c9eaf992","hook_event_name":"beforeShellExecution","cursor_version":"2026.10.01-e373342","workspace_roots":["/tmp/cursor-ws"],"user_email":"user@example.com","transcript_path":"/tmp/agent-transcripts/c9fae782.jsonl"}"#,
+        &["--adapter", "cursor"],
+    );
+    assert_eq!(code, 0);
+    let output = cursor_output(&out);
+    assert_eq!(output["permission"], "deny");
+    assert!(output["user_message"]
+        .as_str()
+        .unwrap()
+        .contains("File deletion blocked"));
+}
+
+#[test]
+fn test_cursor_before_shell_execution_supports_ask_allow_and_deny() {
+    let run = |command: &str| {
+        let input = serde_json::json!({
+            "conversation_id": "c1",
+            "hook_event_name": "beforeShellExecution",
+            "command": command,
+            "cwd": "/tmp/ws",
+            "sandbox": false
+        })
+        .to_string();
+        let (out, code) = run_hook_with_args(&input, &["--adapter", "cursor"]);
+        assert_eq!(code, 0);
+        cursor_output(&out)
+    };
+
+    let ask = run("git push --force origin main");
+    assert_eq!(ask["permission"], "ask");
+    assert!(ask["user_message"].as_str().unwrap().contains("Force push"));
+
+    assert_eq!(run("rm -rf /tmp/x")["permission"], "deny");
+    assert_eq!(run("ls -la"), serde_json::json!({"permission": "allow"}));
+}
+
+#[test]
+fn test_cursor_before_mcp_execution_uses_server_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy.yaml");
+    let rules_path = dir.path().join("rules.yaml");
+    let policy = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: block_dangerous_mcp_delete
+    tool_pattern: "^mcp__danger__delete$"
+    conditions:
+      - "param_eq(target, 'production')"
+      - "param_eq(mcp_server_name, 'danger')"
+      - "param_eq(mcp_tool_name, 'delete')"
+      - "param_eq(agent_tool_name, 'MCP:delete')"
+    action: DENY
+    reason: "dangerous MCP delete blocked"
+  - name: confirm_mcp_publish
+    tool_pattern: "^mcp__danger__publish$"
+    conditions: ["true"]
+    action: ASK
+    reason: "publish needs approval"
+"#;
+    let args = [
+        "--adapter",
+        "cursor",
+        "--policy-path",
+        policy_path.to_str().unwrap(),
+        "--rules-path",
+        rules_path.to_str().unwrap(),
+    ];
+
+    // tool_input is a JSON string on this event; spoofed identity fields inside it
+    // are overwritten by the host-supplied server and tool names.
+    let (out, code) = run_hook_with_args_and_signet_dir(
+        r#"{"conversation_id":"c1","hook_event_name":"beforeMCPExecution","tool_name":"delete","tool_input":"{\"target\":\"production\",\"mcp_server_name\":\"safe\",\"mcp_tool_name\":\"read\",\"agent_tool_name\":\"spoofed\"}","mcp_server_name":"danger","command":"danger-mcp --stdio"}"#,
+        &args,
+        dir.path(),
+        policy,
+    );
+    assert_eq!(code, 0);
+    let output = cursor_output(&out);
+    assert_eq!(output["permission"], "deny");
+    assert_eq!(output["user_message"], "dangerous MCP delete blocked");
+
+    // cursor-agent ignores ask on beforeMCPExecution, so ASK must deny.
+    let (out, _) = run_hook_with_args_and_signet_dir(
+        r#"{"conversation_id":"c1","hook_event_name":"beforeMCPExecution","tool_name":"publish","tool_input":"{}","mcp_server_name":"danger","url":"https://example.invalid/mcp","mcp_server_url":"https://example.invalid/mcp"}"#,
+        &args,
+        dir.path(),
+        policy,
+    );
+    assert_eq!(cursor_output(&out)["permission"], "deny");
+
+    let (out, _) = run_hook_with_args_and_signet_dir(
+        r#"{"conversation_id":"c1","hook_event_name":"beforeMCPExecution","tool_name":"status","tool_input":"{}","mcp_server_name":"kindex","command":"kin mcp"}"#,
+        &args,
+        dir.path(),
+        policy,
+    );
+    assert_eq!(
+        cursor_output(&out),
+        serde_json::json!({"permission": "allow"})
+    );
+}
+
+#[test]
+fn test_cursor_before_read_file_checks_path_only() {
+    let (out, code) = run_hook_with_args(
+        r#"{"conversation_id":"c1","hook_event_name":"beforeReadFile","file_path":"/Users/x/.signet/policy.yaml","content":"rules: []","attachments":[]}"#,
+        &["--adapter", "cursor"],
+    );
+    assert_eq!(code, 0);
+    let output = cursor_output(&out);
+    assert_eq!(output["permission"], "deny");
+    assert!(output.get("agent_message").is_none());
+
+    // File content is not policy input: protected strings inside it do not deny.
+    let (out, _) = run_hook_with_args(
+        r#"{"conversation_id":"c1","hook_event_name":"beforeReadFile","file_path":"/tmp/ws/README.md","content":"see ~/.signet/policy.yaml","attachments":[]}"#,
+        &["--adapter", "cursor"],
+    );
+    assert_eq!(
+        cursor_output(&out),
+        serde_json::json!({"permission": "allow"})
+    );
+}
+
+#[test]
+fn test_cursor_malformed_input_denies_with_cursor_shape() {
+    for input in [
+        "{}",
+        "not json",
+        r#"{"hook_event_name":"preToolUse","tool_name":"Shell","tool_input":"rm -rf /"}"#,
+        r#"{"hook_event_name":"preToolUse","tool_name":"","tool_input":{}}"#,
+        r#"{"hook_event_name":"beforeShellExecution","cwd":"/tmp"}"#,
+        r#"{"hook_event_name":"beforeMCPExecution","tool_name":"status","tool_input":"{}"}"#,
+        r#"{"hook_event_name":"beforeMCPExecution","tool_name":"status","tool_input":"[1]","mcp_server_name":"kindex"}"#,
+        r#"{"hook_event_name":"beforeMCPExecution","tool_name":"status","tool_input":"{oops","mcp_server_name":"kindex"}"#,
+        r#"{"hook_event_name":"beforeMCPExecution","tool_name":"status","mcp_server_name":"kindex"}"#,
+        r#"{"hook_event_name":"beforeReadFile","content":"x"}"#,
+    ] {
+        let (out, code) = run_hook_with_args(input, &["--adapter", "cursor"]);
+        assert_eq!(code, 0);
+        let output = cursor_output(&out);
+        assert_eq!(output["permission"], "deny", "input: {input}");
+        assert!(
+            output["user_message"]
+                .as_str()
+                .unwrap()
+                .contains("Malformed"),
+            "input: {input}"
+        );
+    }
+}
+
+#[test]
+fn test_cursor_inject_context_rides_pretooluse_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: nudge_always
+    tool_pattern: "^Read$"
+    action: INJECT
+    inject:
+      trigger:
+        mode: constant
+        peak: 1.0
+        cooldown_seconds: 0
+      payload:
+        text: "USE KINDEX REMINDER"
+        substitutions: false
+"#;
+    let policy_path = dir.path().join("policy.yaml");
+    let rules_path = dir.path().join("rules.yaml");
+    let (out, code) = run_hook_with_args_and_signet_dir(
+        r#"{"conversation_id":"c1","hook_event_name":"preToolUse","tool_name":"Read","tool_input":{"file_path":"/tmp/x"}}"#,
+        &[
+            "--adapter",
+            "cursor",
+            "--policy-path",
+            policy_path.to_str().unwrap(),
+            "--rules-path",
+            rules_path.to_str().unwrap(),
+        ],
+        dir.path(),
+        policy,
+    );
+    assert_eq!(code, 0);
+    let output = cursor_output(&out);
+    assert_eq!(output["permission"], "allow");
+    assert!(output["additional_context"]
+        .as_str()
+        .unwrap()
+        .contains("USE KINDEX REMINDER"));
+}
+
+// --- Muse adapter (payloads follow muse 1.4.6-R6000.1) ---
+
+#[test]
+fn test_muse_live_shell_payload_denies_rm() {
+    // Captured from a real Muse PreToolUse hook invocation.
+    let (out, code) = run_hook_with_args(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":"rm -rf /tmp/x"},"tool_use_id":"user_shell_01927f6e-8a3c-7b2d-9e4f-0a1b2c3d4e61","session_id":"01a1311e-cca5-7900-a7bf-a90b80db2838","turn_id":"01927f6e-8a3c-7b2d-9e4f-0a1b2c3d4e61","cwd":"/tmp/ws","transcript_path":null,"model":"unknown","permission_mode":"default"}"#,
+        &["--adapter", "muse"],
+    );
+    assert_eq!(code, 0);
+
+    let output = hook_specific_output(&out);
+    assert_eq!(output["hookEventName"], "PreToolUse");
+    assert_eq!(output["permissionDecision"], "deny");
+    assert!(output["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains("File deletion blocked"));
+}
+
+#[test]
+fn test_muse_pretooluse_allow_emits_no_output() {
+    // Muse rejects a bare permissionDecision "allow" as a failed hook.
+    let (out, code) = run_hook_with_args(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":"ls -la"},"session_id":"s1","cwd":"/tmp"}"#,
+        &["--adapter", "muse"],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn test_muse_pretooluse_ask_maps_to_deny() {
+    let (out, code) = run_hook_with_args(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":"git push --force origin main"},"session_id":"s1"}"#,
+        &["--adapter", "muse"],
+    );
+    assert_eq!(code, 0);
+
+    let output = hook_specific_output(&out);
+    assert_eq!(output["permissionDecision"], "deny");
+    assert!(!output["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn test_muse_native_file_tools_map_to_file_rules() {
+    for tool in ["write_file", "edit_file"] {
+        let input = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": tool,
+            "tool_input": {"path": "/app/.env", "file_path": "/tmp/spoofed.txt", "content": "x"},
+            "session_id": "s1"
+        })
+        .to_string();
+        let (out, code) = run_hook_with_args(&input, &["--adapter", "muse"]);
+        assert_eq!(code, 0);
+        let output = hook_specific_output(&out);
+        assert_eq!(output["permissionDecision"], "deny", "tool: {tool}");
+        let reason = output["permissionDecisionReason"].as_str().unwrap();
+        assert!(
+            reason.contains("credential/secret files")
+                || reason.contains("No Kindex session engagement"),
+            "unexpected {tool} denial reason: {reason}"
+        );
+    }
+}
+
+#[test]
+fn test_muse_permission_request_shapes() {
+    let (out, _) = run_hook_with_args(
+        r#"{"hook_event_name":"PermissionRequest","tool_name":"shell","tool_input":{"command":"ls -la"},"session_id":"s1"}"#,
+        &["--adapter", "muse"],
+    );
+    let output = hook_specific_output(&out);
+    assert_eq!(output["hookEventName"], "PermissionRequest");
+    assert_eq!(output["decision"]["behavior"], "allow");
+
+    let (out, _) = run_hook_with_args(
+        r#"{"hook_event_name":"PermissionRequest","tool_name":"shell","tool_input":{"command":"rm -rf /tmp/x"},"session_id":"s1"}"#,
+        &["--adapter", "muse"],
+    );
+    let output = hook_specific_output(&out);
+    assert_eq!(output["decision"]["behavior"], "deny");
+    assert!(output["decision"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("File deletion blocked"));
+
+    // ASK defers to Muse's own approval prompt; Muse rejects behavior "ask".
+    let (out, code) = run_hook_with_args(
+        r#"{"hook_event_name":"PermissionRequest","tool_name":"shell","tool_input":{"command":"git push --force origin main"},"session_id":"s1"}"#,
+        &["--adapter", "muse"],
+    );
+    assert_eq!(code, 0);
+    assert_eq!(out, "");
+}
+
+#[test]
+fn test_muse_malformed_input_denies_with_reason() {
+    for input in [
+        "{}",
+        "not json",
+        r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":"rm -rf /"}"#,
+    ] {
+        let (out, code) = run_hook_with_args(input, &["--adapter", "muse"]);
+        assert_eq!(code, 0);
+        let output = hook_specific_output(&out);
+        assert_eq!(output["permissionDecision"], "deny", "input: {input}");
+        assert!(output["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("Malformed"));
+    }
+}
+
+#[test]
+fn test_muse_inject_context_without_permission_decision_on_allow() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: nudge_always
+    tool_pattern: "^Read$"
+    action: INJECT
+    inject:
+      trigger:
+        mode: constant
+        peak: 1.0
+        cooldown_seconds: 0
+      payload:
+        text: "USE KINDEX REMINDER"
+        substitutions: false
+"#;
+    let policy_path = dir.path().join("policy.yaml");
+    let rules_path = dir.path().join("rules.yaml");
+    let (out, code) = run_hook_with_args_and_signet_dir(
+        r#"{"hook_event_name":"PreToolUse","tool_name":"read_file","tool_input":{"path":"/tmp/x"},"session_id":"s1"}"#,
+        &[
+            "--adapter",
+            "muse",
+            "--policy-path",
+            policy_path.to_str().unwrap(),
+            "--rules-path",
+            rules_path.to_str().unwrap(),
+        ],
+        dir.path(),
+        policy,
+    );
+    assert_eq!(code, 0);
+    let output = hook_specific_output(&out);
+    assert!(output.get("permissionDecision").is_none());
+    assert!(output["additionalContext"]
+        .as_str()
+        .unwrap()
+        .contains("USE KINDEX REMINDER"));
+}
+
 // --- Self-protection integration tests ---
 
 #[test]
@@ -955,10 +1148,88 @@ rules:
     assert!(out.contains("timed out"));
 }
 
+/// Run a Bash `deploy` call against one ENSURE rule whose custom message
+/// leaves out the check name, and return the hook output.
+fn run_ensure_with_custom_message(dir: &std::path::Path, check: &str, timeout: u32) -> String {
+    let policy = format!(
+        r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: ensure_test
+    tool_pattern: ".*"
+    conditions:
+      - "contains(parameters, 'deploy')"
+    action: ENSURE
+    ensure:
+      check: {check}
+      timeout: {timeout}
+      message: Deploy blocked
+"#
+    );
+    let (out, code) = run_hook_with_policy(
+        r#"{"tool_name":"Bash","tool_input":{"command":"deploy app"}}"#,
+        &policy,
+        dir,
+    );
+    assert_eq!(code, 0);
+    assert_eq!(parse_decision(&out), "deny", "{out}");
+    assert!(out.contains("Deploy blocked"), "{out}");
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_unspawnable_check_named_despite_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    let script = checks_dir.join("noexec-check");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let out = run_ensure_with_custom_message(dir.path(), "noexec-check", 5);
+    assert!(out.contains("'noexec-check'"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_timed_out_check_named_despite_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    let script = checks_dir.join("hang-check");
+    std::fs::write(&script, "#!/bin/sh\nsleep 60\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let out = run_ensure_with_custom_message(dir.path(), "hang-check", 1);
+    assert!(out.contains("'hang-check'"), "{out}");
+    assert!(out.contains("timed out"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_escaping_check_named_despite_custom_message() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    let outside = dir.path().join("outside-script");
+    std::fs::write(&outside, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&outside, checks_dir.join("escape-check")).unwrap();
+
+    let out = run_ensure_with_custom_message(dir.path(), "escape-check", 5);
+    assert!(out.contains("'escape-check'"), "{out}");
+    assert!(out.contains("escapes checks directory"), "{out}");
+}
+
 #[test]
 fn test_hook_ensure_missing_script() {
-    // Unlocked ensure rule with missing script → allow gracefully.
-    // (Locked ensure with missing script would deny — tested via self-protection.)
+    // An operator-authored ensure rule whose script is absent cannot be
+    // evaluated, so it denies and says why instead of allowing silently.
     let dir = tempfile::tempdir().unwrap();
     let checks_dir = dir.path().join("checks");
     std::fs::create_dir_all(&checks_dir).unwrap();
@@ -986,7 +1257,77 @@ rules:
         dir.path(),
     );
     assert_eq!(code, 0);
-    assert_eq!(parse_decision(&out), "allow");
+    assert_eq!(parse_decision(&out), "deny");
+    assert!(out.contains("Script missing"), "{out}");
+    assert!(out.contains("nonexistent-script"), "{out}");
+}
+
+#[test]
+fn test_hook_ensure_missing_checks_dir_denies() {
+    // No checks directory at all, as on a machine where rules.yaml was synced
+    // without ~/.signet/checks/.
+    let dir = tempfile::tempdir().unwrap();
+
+    let policy = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: ensure_test
+    tool_pattern: "^Bash$"
+    conditions:
+      - "contains(parameters, 'push')"
+    action: ENSURE
+    ensure:
+      check: identity-check
+      timeout: 5
+"#;
+
+    let (out, code) = run_hook_with_policy(
+        r#"{"tool_name":"Bash","tool_input":{"command":"git push"}}"#,
+        policy,
+        dir.path(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(parse_decision(&out), "deny");
+    assert!(out.contains("identity-check"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_hook_ensure_dangling_symlink_denies() {
+    // A check that links to a script which no longer exists cannot be
+    // canonicalized, and must deny like any other missing script.
+    let dir = tempfile::tempdir().unwrap();
+    let checks_dir = dir.path().join("checks");
+    std::fs::create_dir_all(&checks_dir).unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("removed-script"),
+        checks_dir.join("linked-check"),
+    )
+    .unwrap();
+
+    let policy = r#"
+version: 1
+default_action: ALLOW
+rules:
+  - name: ensure_test
+    tool_pattern: "^Bash$"
+    conditions:
+      - "contains(parameters, 'push')"
+    action: ENSURE
+    ensure:
+      check: linked-check
+      timeout: 5
+"#;
+
+    let (out, code) = run_hook_with_policy(
+        r#"{"tool_name":"Bash","tool_input":{"command":"git push"}}"#,
+        policy,
+        dir.path(),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(parse_decision(&out), "deny");
+    assert!(out.contains("linked-check"), "{out}");
 }
 
 #[test]

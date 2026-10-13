@@ -37,7 +37,7 @@ jobs:
         run: cargo +stable test --workspace --release --locked --no-default-features --no-fail-fast -- --test-threads=1
       - name: Release binary
         run: cargo +stable build --release --locked
-      - name: Python acceptance tests (PR15)
+      - name: Python acceptance tests
         shell: bash
         run: |
           set -euo pipefail
@@ -50,6 +50,10 @@ jobs:
           export TMPDIR
           echo "SIGNET_EVAL_BINARY=${SIGNET_EVAL_BINARY}"
           echo "TMPDIR=${TMPDIR}"
-          python3 tests/test_pr15_behavior.py
+          status=0
+          python3 tests/test_pr15_behavior.py || status=1
+          python3 tests/test_ensure_behavior.py || status=1
+          python3 tests/test_mcp_behavior.py || status=1
+          exit "${status}"
       - name: Verify packaged source and embedded adapter
         run: cargo +stable package --locked

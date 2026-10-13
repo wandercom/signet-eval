@@ -94,6 +94,55 @@ For Antigravity, add this block to `~/.gemini/config/hooks.json` (merge it with 
 
 The same configuration is available at [`hooks/antigravity-hooks.json`](hooks/antigravity-hooks.json).
 
+For Cursor, add to `~/.cursor/hooks.json` (user) or `<repo>/.cursor/hooks.json`
+(project), merging with any existing events:
+
+```json
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [{
+      "command": "/bin/bash -lc 'source ~/.profile >/dev/null 2>&1 || true; exec signet-eval --adapter cursor'",
+      "matcher": "^(?!Shell$|MCP:)",
+      "timeout": 30,
+      "failClosed": true
+    }],
+    "beforeShellExecution": [{
+      "command": "/bin/bash -lc 'source ~/.profile >/dev/null 2>&1 || true; exec signet-eval --adapter cursor'",
+      "timeout": 30,
+      "failClosed": true
+    }],
+    "beforeMCPExecution": [{
+      "command": "/bin/bash -lc 'source ~/.profile >/dev/null 2>&1 || true; exec signet-eval --adapter cursor'",
+      "timeout": 30,
+      "failClosed": true
+    }]
+  }
+}
+```
+
+The same configuration is available at [`hooks/cursor-hooks.json`](hooks/cursor-hooks.json).
+The `preToolUse` matcher skips shell and MCP calls because the two dedicated
+events evaluate them; without it, each such call is evaluated and logged twice.
+
+For Muse Code, add a top-level `hooks` member to `~/.config/muse/settings.json`
+(user scope; keep `schema_version` and your other settings), or save the file as
+`<repo>/.muse/hooks.json` (project scope, which Muse enables only for trusted
+workspaces):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [{
+      "matcher": "*",
+      "hooks": [{"type": "command", "command": "signet-eval --adapter muse"}]
+    }]
+  }
+}
+```
+
+The same configuration is available at [`hooks/muse-hooks.json`](hooks/muse-hooks.json).
+
 **2. Done.** Every tool call now passes through policy evaluation. The default policy blocks destructive operations, protects its own configuration, and allows everything else.
 
 **3. (Optional) Customize** — talk to Claude with the MCP server:
@@ -117,6 +166,7 @@ Self-protection rules are **locked** — they cannot be removed, edited, or reor
 | Direct edit tools without recent Kindex tag/search/context | **deny** | yes |
 | Claude `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`, `TodoWrite` | **deny** | yes |
 | `rm`, `rmdir` | **deny** | |
+| Cursor's native `Delete` tool | **deny** | |
 | `git push --force` | **ask** | |
 | Git remote and `gh` operations with mismatched target-owner identity | **deny** | |
 | `mkfs`, `format`, `dd if=` | **deny** | |
@@ -160,6 +210,44 @@ rules:
 ```
 
 Rules are evaluated in order — first match wins. Multiple conditions on a rule are AND'd. Rules with `locked: true` cannot be modified through the MCP management server.
+
+## ENSURE check context
+
+User-managed ENSURE scripts receive the original normalized tool name and input
+on stdin. `SIGNET_TOOL_COMMAND` carries the first non-empty string among the
+normalized `command` and `cmd` fields as a literal environment value. It is empty
+when neither field holds one.
+The forwarding mechanism does not interpret that value as shell code.
+
+`SIGNET_TOOL_CWD` uses the normalized tool `cwd`/`workdir`, then the host envelope's
+`cwd`, then the hook process's working directory. Empty values are skipped.
+`SIGNET_TOOL_CWD_SOURCE` says which one was used: `tool_input`, `host`, or `process`.
+`SIGNET_HOST_CWD` carries the host envelope's `cwd` on its own, or is empty when the
+host sent none. A `tool_input` directory is where the host will run the command, but
+the model wrote it. The process fallback is not an independently verified execution
+directory. None of these is a trusted location attestation, and a check that
+authorizes on location should look at the source before relying on the value.
+Signet does not interpret the command, so a `cd` inside it does not change
+`SIGNET_TOOL_CWD`. All of these environment values replace inherited ones, and stdin
+remains unchanged.
+
+A missing or unresolvable check script denies the call with a reason naming the
+check, for user rules as well as locked ones. Signet installs no check scripts, so
+copy `~/.signet/checks/` along with any `rules.yaml` that refers to it.
+
+Older releases shipped a `github_identity_guard` system rule. A copy of it left in
+`policy.yaml` is ignored, and `signet-eval validate` reports it as a warning. To keep
+an identity check, put the rule in `rules.yaml` with a script you maintain.
+
+From the repository root after `cargo build --release`, run the independent local
+acceptance checks with:
+
+```bash
+SIGNET_EVAL_BINARY="$(pwd)/target/release/signet-eval" python3 tests/test_ensure_behavior.py
+```
+
+These Python acceptance checks can run locally and are also collected by hosted
+CI on Linux and macOS against the release binary, alongside Rust and packaging checks.
 
 ## Advisory Injection
 
@@ -375,6 +463,8 @@ claude mcp add --scope user --transport stdio signet-proxy -- signet-eval proxy
 | `signet-eval --adapter codex` | Codex `PreToolUse` hook evaluation |
 | `signet-eval --adapter codex-permission` | Codex `PermissionRequest` hook evaluation |
 | `signet-eval --adapter antigravity` | Antigravity `PreToolUse` hook evaluation |
+| `signet-eval --adapter cursor` | Cursor `preToolUse`, `beforeShellExecution`, `beforeMCPExecution` and `beforeReadFile` hook evaluation |
+| `signet-eval --adapter muse` | Muse Code `PreToolUse` (and optional `PermissionRequest`) hook evaluation |
 | `signet-eval integration describe` | Read-only policy/capability inspection from JSON stdin |
 | `signet-eval integration adjudicate` | Scoped, revision-bound Kindex task admission with durable intent receipt |
 | `signet-eval integration record-result` | Idempotent delivery of a Kindex task receipt; not proof of execution |
@@ -423,7 +513,7 @@ signet-eval is a **seatbelt, not a cage**. Understanding what it does and doesn'
 
 ### What it protects against
 
-**A cooperative agent making mistakes.** Claude Code, Codex, and Antigravity follow hook protocols — they call signet-eval around tool use and respect the supported responses. Within those protocols, signet-eval reliably enforces policy:
+**A cooperative agent making mistakes.** Claude Code, Codex, Antigravity, Cursor, and Muse Code follow hook protocols — they call signet-eval around tool use and respect the supported responses. Within those protocols, signet-eval reliably enforces policy:
 
 - Blocks destructive commands (`rm`, `mkfs`, piped remote execution)
 - Enforces spending limits across tool calls
@@ -436,6 +526,42 @@ This is the normal operating mode. The agent isn't trying to escape — it's try
 Codex support has one important semantic difference: `PreToolUse` is currently deny-only for enforcement, so Signet `ALLOW` emits no output and Signet `ASK` is converted to a deny at that stage. The `PermissionRequest` adapter explicitly allows or denies requests Codex was already going to send through approval; Signet `ASK` defers to Codex's normal approval prompt.
 
 Antigravity sends a nested `toolCall` payload and expects a top-level `decision` response. The adapter normalizes native command and file tools to Signet's canonical policy names, unwraps `call_mcp_tool` into `mcp__<server>__<tool>`, and fails closed when the native wrapper is malformed.
+
+Cursor semantics (verified against `cursor-agent` 2026.10.01): the adapter reads
+`hook_event_name` and answers with Cursor's flat `permission` object. Only
+`beforeShellExecution` can ask; there Signet `ASK` becomes Cursor's approval
+prompt. `preToolUse` enforces only deny, `cursor-agent` ignores `ask` on
+`beforeMCPExecution` although Cursor's documentation lists it, and
+`beforeReadFile` accepts only allow or deny, so Signet `ASK` becomes a deny on
+those three events. Cursor's `Shell` tool maps to `Bash`, and
+`beforeMCPExecution` maps to `mcp__<server>__<tool>` with the arguments decoded
+from Cursor's JSON string; `preToolUse` sees MCP calls only as `MCP:<tool>`,
+without the server, which is why the sample routes MCP to the dedicated event.
+`beforeReadFile` evaluates the path, not the file content Cursor attaches.
+Signet emits `allow` explicitly, because Cursor treats empty output as a failed
+hook. Cursor fails open when a hook crashes, times out, or exits non-zero unless
+the entry sets `failClosed: true`, as the sample does; invalid JSON blocks the
+action either way. Cursor also runs hooks from Claude Code's
+`~/.claude/settings.json` and project `.claude/settings*.json`. Those receive
+Cursor payloads, so a plain `signet-eval` Claude hook there runs a second,
+unnormalized evaluation in Cursor; it does not deduplicate against the Cursor
+adapter, whose command differs.
+
+Muse Code semantics (verified against Muse 1.4.6): Muse sends Claude-shaped
+`PreToolUse` payloads with its own tool names. The adapter maps `shell` (and
+`bash`, `bash_input`, `exec_command`, `execute_command`) to `Bash`,
+`read_file`/`write_file`/`edit_file` to `Read`/`Write`/`Edit` (copying a native
+`path` into `file_path`), `search` to `Grep`, and `web_fetch`/`web_search` to
+`WebFetch`/`WebSearch`; MCP tools already arrive as `mcp__<server>__<tool>`.
+Muse `PreToolUse` enforces only deny: it ignores `ask` and rejects a bare
+`allow`, so Signet `ALLOW` emits no output (or only `additionalContext` for an
+inject nudge) and Signet `ASK` becomes a deny. Muse has no fail-closed hook
+option: a crashed, timed-out, or unparseable hook lets the tool call proceed.
+Project hooks in `.muse/hooks.json` stay disabled until the workspace is
+trusted. Muse does not run Claude Code or Codex hooks. The adapter also accepts
+`PermissionRequest` with the Codex response shape (`ASK` defers to Muse's
+prompt), but the sample omits it: with the default `ALLOW` policy it would
+approve every call Muse was about to ask about.
 
 ### What it does NOT protect against
 

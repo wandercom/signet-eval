@@ -1,1 +1,4 @@
 /target
+
+# Generated Pact run state (absolute local paths; not needed to operate)
+.pact/state.json

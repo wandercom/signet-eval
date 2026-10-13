@@ -115,33 +115,22 @@ fn test_init_preserves_user_rules() {
 
 #[cfg(unix)]
 #[test]
-fn validation_keeps_warnings_for_missing_custom_and_broken_builtin_checks() {
-    use std::os::unix::fs::symlink;
-    for check in ["custom-check", "gh-identity-matches-remote"] {
-        let dir = tempfile::tempdir().unwrap();
-        let policy = dir.path().join("policy.yaml");
-        std::fs::write(
-            &policy,
-            format!("version: 1\ndefault_action: ALLOW\nrules:\n- name: check\n  tool_pattern: '^Bash$'\n  conditions: ['true']\n  action: ENSURE\n  ensure:\n    check: {check}\n    timeout: 5\n"),
-        ).unwrap();
-        if check == "gh-identity-matches-remote" {
-            std::fs::create_dir(dir.path().join("checks")).unwrap();
-            symlink(
-                dir.path().join("missing"),
-                dir.path().join("checks").join(check),
-            )
-            .unwrap();
-        }
-        let output = Command::new(env!("CARGO_BIN_EXE_signet-eval"))
-            .args(["--policy-path", policy.to_str().unwrap(), "validate"])
-            .env("HOME", dir.path())
-            .env("SIGNET_DIR", dir.path())
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot resolve ensure script"));
-        assert!(!String::from_utf8_lossy(&output.stdout).contains("Policy valid"));
-    }
+fn validation_keeps_warnings_for_missing_custom_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("policy.yaml");
+    std::fs::write(
+        &policy,
+        "version: 1\ndefault_action: ALLOW\nrules:\n- name: check\n  tool_pattern: '^Bash$'\n  conditions: ['true']\n  action: ENSURE\n  ensure:\n    check: custom-check\n    timeout: 5\n",
+    ).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_signet-eval"))
+        .args(["--policy-path", policy.to_str().unwrap(), "validate"])
+        .env("HOME", dir.path())
+        .env("SIGNET_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot resolve ensure script"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Policy valid"));
 }
 
 #[test]
@@ -272,6 +261,44 @@ fn test_test_command_accepts_antigravity_payload() {
         stdout.contains("Deny"),
         "stdout should contain Deny: {stdout}"
     );
+}
+
+#[test]
+fn test_test_command_accepts_cursor_and_muse_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy_path = dir.path().join("policy.yaml");
+    let rules_path = dir.path().join("rules.yaml");
+    let path_str = policy_path.to_str().unwrap();
+    let rules_str = rules_path.to_str().unwrap();
+
+    signet_eval(&["--policy-path", path_str, "--rules-path", rules_str, "init"]);
+
+    for (adapter, payload) in [
+        (
+            "cursor",
+            r#"{"conversation_id":"c1","hook_event_name":"beforeShellExecution","command":"rm foo","cwd":"/tmp","sandbox":false}"#,
+        ),
+        (
+            "muse",
+            r#"{"hook_event_name":"PreToolUse","tool_name":"shell","tool_input":{"command":"rm foo"},"session_id":"s1"}"#,
+        ),
+    ] {
+        let (stdout, stderr, code) = signet_eval(&[
+            "--adapter",
+            adapter,
+            "--policy-path",
+            path_str,
+            "--rules-path",
+            rules_str,
+            "test",
+            payload,
+        ]);
+        assert_eq!(code, 0, "{adapter} test failed: {stderr}");
+        assert!(
+            stdout.contains("Deny"),
+            "{adapter} stdout should contain Deny: {stdout}"
+        );
+    }
 }
 
 #[test]

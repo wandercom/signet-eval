@@ -130,7 +130,7 @@ mod tests {
             assert!(!serialized.contains(secret));
         }
         assert_eq!(summary("🔑password=private-value", 8), "🔑passwor");
-        assert!(!text("WANDER_ANTHROPIC_API_KEY=private AWS_SECRET_ACCESS_KEY=private postgres://user:private@db").contains("private"));
+        assert!(!text("ACME_ANTHROPIC_API_KEY=private AWS_SECRET_ACCESS_KEY=private postgres://user:private@db").contains("private"));
         assert!(
             !value(&serde_json::json!({"AWS_SECRET_ACCESS_KEY":"private"}))
                 .to_string()

@@ -2,6 +2,7 @@
 # C001-C013: Gate and Ensure actions (constrain interview + manual refinement)
 # C014-C019: CLI observability and auto-fix (2026-04-02)
 # C020-C027: Preflight session scoping (2026-04-03)
+# C028-C029: Operator-managed ENSURE checks (2026-10-09)
 
 - id: C001
   boundary: Evaluation Determinism
@@ -136,19 +137,6 @@
     The script knows why it failed (e.g., "active user is jmc-wander but remote is jmcentire").
     Relaying this to the agent helps it take corrective action voluntarily.
   affected_components: [policy.rs, hook.rs]
-
-- id: C011
-  boundary: Git Remote Identity Matching
-  condition: >
-    The gh-identity-matches-remote check script must handle: (a) remote URL contains
-    "jmcentire" -> require jmcentire account, (b) remote URL contains "wandercom" ->
-    require jmc-wander account, (c) remote URL contains neither -> prompt user to choose,
-    (d) not inside a git repo (e.g., gh commands without a repo context) -> pass through
-    with a warning, (e) multiple remotes -> check the remote being targeted (default: origin).
-  violation: Wrong-account operations proceed unchecked.
-  severity: must
-  rationale: This is the motivating use case. The script must cover all realistic scenarios.
-  affected_components: [checks/gh-identity-matches-remote]
 
 - id: C012
   boundary: MCP Tool Support
@@ -380,3 +368,34 @@
     Reading an environment variable and adding a column to SQLite requires
     zero new dependencies. The existing stack is sufficient.
   affected_components: [Cargo.toml]
+
+- id: C028
+  boundary: Unevaluable ENSURE Fails Closed
+  condition: >
+    An ENSURE rule whose check script is missing, unresolvable, or not spawnable denies
+    the call with a reason naming the check, whether the rule is locked or not. The binary
+    installs no check scripts, so every ENSURE script is operator-managed.
+  violation: >
+    A rule the operator wrote to deny allows silently when its script is absent, for
+    example after rules.yaml is synced to a machine without ~/.signet/checks/.
+  severity: must
+  rationale: >
+    "Cannot evaluate" is not "passed". Graceful allow was only defensible while the binary
+    materialized its own check before first use.
+  affected_components: [hook.rs]
+
+- id: C029
+  boundary: ENSURE Context Provenance
+  condition: >
+    Check scripts receive SIGNET_TOOL_COMMAND and SIGNET_TOOL_CWD as literal environment
+    values that override inherited ones, never as shell source. SIGNET_TOOL_CWD_SOURCE names
+    where SIGNET_TOOL_CWD came from (tool_input, host, or process) and SIGNET_HOST_CWD carries
+    the host envelope cwd separately. Empty values are treated as absent.
+  violation: >
+    A check cannot tell model-supplied context from host-supplied context, or a stale
+    inherited value reaches the check.
+  severity: must
+  rationale: >
+    The tool's requested directory is where the host runs the command, but the model wrote
+    it. Checks that authorize on location need to know which source they are trusting.
+  affected_components: [hook.rs]
