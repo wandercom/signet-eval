@@ -102,10 +102,18 @@ export const register: Register = (on, options) => {
     if (state !== "active") return {deny:blocked(state)};
     let context = "";
     let failure = "policy_owner_unavailable";
+    // The host, not the tool input, names the model. Without a host answer the
+    // envelope omits it and model-scoped rules see agent_model as absent.
+    let model = "";
+    try {
+      const reported: unknown = await $.session.model();
+      if (typeof reported === "string") model = reported.trim();
+    } catch { /* Absent model: model-scoped allowlists fail closed. */ }
     try {
       const {tool, tool_use_id, ...tool_input} = e;
+      const envelope = {hook_event_name:"PreToolUse",tool_name:tool,tool_input,session_id:sessionId,cwd,...(model ? {model} : {})};
       const output = await $.process.run([executable], {
-        stdin:JSON.stringify({hook_event_name:"PreToolUse",tool_name:tool,tool_input,session_id:sessionId,cwd}),timeoutMs:10000,
+        stdin:JSON.stringify(envelope),timeoutMs:10000,
       });
       if (output.exitCode !== 0) return {deny:blocked(failure)};
       failure = "invalid_policy_response";

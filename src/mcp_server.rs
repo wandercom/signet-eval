@@ -976,7 +976,7 @@ fn handle_condition_help() -> String {
   param_lt(field, number)              — parameter field < number
   param_contains(field, 'substr')      — parameter field contains substring
   matches(field, 'regex')              — parameter field matches regex pattern
-  matches(agent_model, '^claude-opus-') — model that issued the call (hook mode; absent if unknown)
+  matches(agent_model, '^claude-opus-') — host-reported issuing model (hook mode; absent if the host sends none)
   has_credential('name')               — credential exists in vault
   spend_gt('category', limit)          — session spend > limit
   spend_plus_amount_gt('cat', field, limit) — session spend + param > limit

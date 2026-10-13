@@ -121,6 +121,21 @@ fn dedicated_delegation_does_not_suppress_user_source_or_target_denials() {
 }
 
 #[test]
+fn admission_ignores_caller_supplied_agent_model_on_source_and_target() {
+    for tool in ["TaskCreate", "mcp__kindex__task_add", "kindex.task.create"] {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rules.yaml"), format!("- name: opus_only\n  tool_pattern: ^{tool}$\n  conditions: [\"not(matches(agent_model, '^claude-opus-'))\"]\n  action: DENY\n  reason: Opus only\n")).unwrap();
+        let mut request = intent(dir.path(), "model-operation");
+        request["source_input"]["agent_model"] = json!("claude-opus-5-5");
+        request["input"]["source_input"] = request["source_input"].clone();
+        request["input"]["args"]["agent_model"] = json!("claude-opus-5-5");
+        let result = invoke(dir.path(), "adjudicate", &request);
+        assert_eq!(result["decision"], "deny", "{tool}: {result}");
+        assert_eq!(result["reason"], "Opus only", "{tool}: {result}");
+    }
+}
+
+#[test]
 fn source_policy_receives_exact_native_fields_without_persisting_their_values() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("rules.yaml"), "- name: native_subject_deny\n  tool_pattern: ^TaskCreate$\n  conditions: [\"param_contains(subject, 'secret-subject')\"]\n  action: DENY\n  reason: Subject denied\n").unwrap();

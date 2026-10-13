@@ -101,6 +101,14 @@ explicit warning that Signet redaction is unavailable. This is an availability
 tradeoff for recovery prompts; avoid entering secrets while that warning is
 present. Confirmed disabled state forwards the original prompt neutrally.
 
+Before each policy evaluation the adapter asks the host for `$.session.model()`
+and, when the answer is a string, passes it as the envelope `model`. Policy
+sees it as `agent_model`. A host without that call, an error or a non-string
+answer omits the field, and model-scoped rules see `agent_model` as absent.
+Tool input never supplies it: the binary discards any `agent_model` there. The
+answer is the session's model; subagent attribution is not qualified, and this
+call has not been probed on the exact 2.1.274 and 2.1.280 hosts.
+
 When the host returns an error or no typed result, the adapter preserves its
 sanitized error text in the denial channel, including the underlying policy
 explanation. It never turns an error into a successful typed tool result.

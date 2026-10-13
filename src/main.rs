@@ -453,7 +453,7 @@ fn run() -> i32 {
                     std::process::exit(1);
                 }
             };
-            hook::attach_agent_model(&input, &compiled, v.as_ref(), false, &mut call);
+            hook::attach_agent_model(&input, &compiled, v.as_ref(), &mut call);
             let result = policy::evaluate(&call, &compiled, v.as_ref());
             println!("Decision:     {:?}", result.decision);
             if let Some(rule) = &result.matched_rule {

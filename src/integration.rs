@@ -270,10 +270,15 @@ fn delegated_source(source: &str, operation: &str, mcp: &str) -> bool {
 }
 
 fn authorize(
-    call: &policy::ToolCall,
+    mut call: policy::ToolCall,
     compiled: &policy::CompiledPolicy,
     loaded_vault: Option<&vault::Vault>,
 ) -> Result<(), String> {
+    // The intent carries no host-attested model, so a caller-supplied
+    // `agent_model` in source or target input is dropped: model-scoped rules
+    // and preflight constraints see the field as absent.
+    hook::strip_agent_model(&mut call);
+    let call = &call;
     let result = policy::evaluate(call, compiled, loaded_vault);
     let result = if result.decision == policy::Decision::Ensure {
         hook::resolve_ensure_result(result, call)
@@ -361,7 +366,7 @@ fn adjudicate(input: Value, policy_path: &Path, rules_path: &Path) -> Result<Val
         .retain(|r| !(r.locked && r.name == "prefer_persistent_task_store"));
     let parameters = intent.input["args"].clone();
     authorize(
-        &policy::ToolCall {
+        policy::ToolCall {
             tool_name: intent.source_tool.clone(),
             parameters: source_input.clone(),
         },
@@ -370,7 +375,7 @@ fn adjudicate(input: Value, policy_path: &Path, rules_path: &Path) -> Result<Val
     )?;
     for name in [mcp, &intent.target_tool] {
         authorize(
-            &policy::ToolCall {
+            policy::ToolCall {
                 tool_name: name.into(),
                 parameters: parameters.clone(),
             },
