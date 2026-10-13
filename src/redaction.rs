@@ -1,4 +1,8 @@
 //! Sanitization for diagnostic data, never for the policy input being adjudicated.
+//!
+//! Known secrets from the optional user config (`crate::secret_mask`) become
+//! `$NAME` first, so every sink that already sanitizes also masks them.
+use crate::secret_mask::{self, Table};
 use regex::Regex;
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -19,7 +23,11 @@ fn patterns() -> &'static Vec<Regex> {
 }
 
 pub fn text(input: &str) -> String {
-    let mut output = input.to_owned();
+    text_with(input, &secret_mask::table())
+}
+
+fn text_with(input: &str, known: &Table) -> String {
+    let mut output = secret_mask::mask_text(input, known);
     for pattern in patterns() {
         output = pattern.replace_all(&output, MASK).into_owned();
     }
@@ -76,19 +84,23 @@ fn sensitive_key(key: &str) -> bool {
 }
 
 pub fn value(input: &Value) -> Value {
+    value_with(input, &secret_mask::table())
+}
+
+fn value_with(input: &Value, known: &Table) -> Value {
     match input {
-        Value::String(s) => Value::String(text(s)),
-        Value::Array(items) => Value::Array(items.iter().map(value).collect()),
+        Value::String(s) => Value::String(text_with(s, known)),
+        Value::Array(items) => Value::Array(items.iter().map(|v| value_with(v, known)).collect()),
         Value::Object(items) => Value::Object(
             items
                 .iter()
                 .map(|(key, item)| {
                     (
-                        text(key),
+                        text_with(key, known),
                         if sensitive_key(key) && !item.is_null() {
                             Value::String(MASK.into())
                         } else {
-                            value(item)
+                            value_with(item, known)
                         },
                     )
                 })
@@ -144,5 +156,30 @@ mod tests {
             !text("Cookie: first=private; second=private\npassword='private multi word'")
                 .contains("private")
         );
+    }
+
+    #[test]
+    fn known_secrets_become_their_names_before_pattern_redaction() {
+        secret_mask::set_test_pairs(Some(&[
+            ("DEPLOY_HOOK_TOKEN", "plain-synthetic-value-77"),
+            ("ACME_CLIENT_ID", "client-synthetic-id-99"),
+        ]));
+        let input = serde_json::json!({
+            "command": "curl -H x:plain-synthetic-value-77 https://example.test",
+            "nested": ["id=client-synthetic-id-99"],
+            "plain-synthetic-value-77": 1
+        });
+        let safe = value(&input).to_string();
+        let raw_text = text("echo plain-synthetic-value-77");
+        let diag = diagnostic(&input.to_string());
+        let short = summary(&input.to_string(), 40);
+        secret_mask::set_test_pairs(None);
+        for output in [&safe, &raw_text, &diag, &short] {
+            assert!(!output.contains("plain-synthetic-value-77"), "{output}");
+            assert!(!output.contains("client-synthetic-id-99"), "{output}");
+        }
+        assert!(safe.contains("x:$DEPLOY_HOOK_TOKEN"));
+        assert!(safe.contains("id=$ACME_CLIENT_ID"));
+        assert_eq!(raw_text, "echo $DEPLOY_HOOK_TOKEN");
     }
 }

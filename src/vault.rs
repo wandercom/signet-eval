@@ -1711,6 +1711,44 @@ mod tests {
     }
 
     #[test]
+    fn known_secrets_are_masked_in_ledger_and_preflight_records_only() {
+        const VALUE: &str = "synthetic-ledger-value-0077";
+        crate::secret_mask::set_test_pairs(Some(&[("LEDGER_TOKEN", VALUE)]));
+        let dir = tempfile::tempdir().unwrap();
+        let vault = make_test_vault(dir.path(), "testpass123");
+        let detail = serde_json::json!({"command": format!("echo {VALUE}")}).to_string();
+        vault.log_action("Bash", "allow", "", 0.0, &detail);
+        vault
+            .log_preflight_violation(&PreflightViolation {
+                preflight_id: "p1".into(),
+                constraint_name: "c".into(),
+                tool_name: "Bash".into(),
+                parameters_summary: detail.clone(),
+                alternative: format!("not {VALUE}"),
+                timestamp: 1,
+            })
+            .unwrap();
+        let mut preflight = make_preflight("p2", None);
+        preflight.task = format!("deploy with {VALUE}");
+        let rejected = vault.store_preflight(&preflight);
+        // The vault itself stores the credential, not a masked copy.
+        vault.store_credential("deploy", VALUE, 3);
+        let credential = vault.get_credential("deploy");
+        let actions = vault.recent_actions(5);
+        let violations = vault.preflight_violations("p1");
+        crate::secret_mask::set_test_pairs(None);
+
+        assert_eq!(credential.as_deref(), Some(VALUE));
+        let rejected = rejected.unwrap_err();
+        assert!(!rejected.contains(VALUE));
+        assert_eq!(actions[0]["detail"], r#"{"command":"echo $LEDGER_TOKEN"}"#);
+        assert!(violations[0].parameters_summary.contains("$LEDGER_TOKEN"));
+        assert_eq!(violations[0].alternative, "not $LEDGER_TOKEN");
+        let bytes = std::fs::read(dir.path().join("state.db")).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains(VALUE));
+    }
+
+    #[test]
     fn test_setup_and_unlock() {
         let dir = tempfile::tempdir().unwrap();
         let vault = make_test_vault(dir.path(), "testpass123");

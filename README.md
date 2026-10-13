@@ -171,6 +171,7 @@ Self-protection rules are **locked** — they cannot be removed, edited, or reor
 | Git remote and `gh` operations with mismatched target-owner identity | **deny** | |
 | `mkfs`, `format`, `dd if=` | **deny** | |
 | `curl \| sh`, `wget \| sh` | **deny** | |
+| Any tool input carrying a literal [masked secret](#secret-masking) value | **ask** | |
 | Everything else | **allow** | |
 
 ## Custom Policy
@@ -312,6 +313,7 @@ and `{matched_param.X}`. See `examples/inject_examples.yaml`.
 | `or(A \|\| B)` | Either condition | `or(contains(parameters, '-f') \|\| contains(parameters, '--force'))` |
 | `has_recent_action('search', N)` | Recent allowed action matches in tool name or detail; pipe-delimited OR | `has_recent_action('EnterPlanMode\|TaskCreate', 500)` |
 | `has_current_session()` | Hook host supplied a distinct chat/session identifier | `has_current_session()` |
+| `contains_masked_value(parameters)` | Tool input holds a literal value from the [secret masking](#secret-masking) reference files; also takes a field name. Never matches without a config | `contains_masked_value(command)` |
 | `true` / `false` | Literal | `true` |
 
 ### Model-scoped rules
@@ -353,6 +355,58 @@ Write the condition as a negated allowlist so unknown models fail closed:
 On a host that reports no model, this rule denies every matching call.
 Command matching stays substring-based, so an agent determined to reach the
 same binary through an interpreter or wrapper script can still evade it.
+
+## Secret masking
+
+Optional. Create `~/.signet/secret_mask.yaml` (or `$SIGNET_DIR/secret_mask.yaml`)
+naming shell env files that hold your secrets:
+
+```yaml
+files: [~/.profile]          # required; nothing is masked without files
+keys: [OPENAI, "AWS_*_KEY"]  # optional; default fragments below
+min_length: 8                # optional; shorter values are ignored
+```
+
+Without the file the feature is off. `~` expands to `$HOME`; a relative path is
+relative to the signet directory. The file sits under `~/.signet/`, so the
+self-protection rules stop the agent from editing it.
+
+Each reference file is read line by line: an optional `export `, then
+`NAME=VALUE` with `NAME` matching `[A-Za-z_][A-Za-z0-9_]*`. Matching surrounding
+quotes are stripped, and an unquoted value loses a trailing ` #comment`. Values
+containing `$` or a backtick, values with unterminated or concatenated quotes,
+and values shorter than `min_length` are skipped.
+
+A key is selected when its name contains any `keys` entry, case-insensitive,
+with `*` matching any run of characters. A full name therefore also selects
+longer names that contain it. Without `keys`, the default fragments are `KEY`,
+`TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASS`, `PW`, `CREDENTIAL`, `AUTH`,
+`PRIVATE`, `SID`, `DSN`, `WEBHOOK`, `COOKIE`, `CLIENT_ID`, `ACCOUNT_ID` and `API`
+(`DEFAULT_KEY_PATTERNS` in `src/secret_mask.rs`).
+
+Every occurrence of a selected value, and of its JSON-escaped spelling, becomes
+`$NAME`. Longer values are replaced first, file order breaks ties, a value
+shared by several names masks to the first, and a name defined twice masks both
+values. Files are cached and re-read when their mtime or size changes. A missing
+or unreadable file produces one warning on stderr naming the path and masks
+nothing from it; an invalid config turns masking off with one warning.
+
+Masking applies to what signet-eval persists or displays: the action ledger,
+preflight records and violations, Kindex result deliveries, the `integration
+redact` sanitizer used by the Claude function adapter, MCP management replies
+(recent actions, status, violations, rule listings, test results), MCP proxy
+reasons, hook deny/ask reasons and advisory context, and the `rules`, `test` and
+`log` CLI output. It never changes the input policy evaluates and never rewrites
+the command the host runs. A preflight definition containing a masked value is
+rejected, as with other secrets. Vault credentials are stored as given.
+
+A command can genuinely need the literal value, so the default rule
+`block_masked_secret_literal` asks rather than denies when tool input contains
+one. Its reason names the key (`$NAME`), never the value, and suggests using
+`$NAME` instead. Override it in `rules.yaml` like any unlocked default. Rule
+reasons and alternatives can use the `{masked_keys}` placeholder, which expands
+to the matched key names. `signet-eval status` reports the masked key names and
+file count.
 
 ## Encrypted Vault
 

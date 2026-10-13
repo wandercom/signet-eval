@@ -154,30 +154,31 @@ impl ServerHandler for ProxyServer {
                 );
             }
 
+            // Reasons can echo parameters; sanitize like hook mode, after evaluation.
+            let reason = result.reason.as_deref().map(crate::redaction::text);
             match result.decision {
                 Decision::Deny => {
-                    let reason = result.reason.unwrap_or_else(|| "Denied by policy".into());
+                    let reason = reason.unwrap_or_else(|| "Denied by policy".into());
                     Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "DENIED by Signet: {reason}"
                     ))]))
                 }
                 Decision::Ask => {
-                    let reason = result.reason.unwrap_or_else(|| "Requires approval".into());
+                    let reason = reason.unwrap_or_else(|| "Requires approval".into());
                     Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "REQUIRES APPROVAL: {reason}"
                     ))]))
                 }
                 Decision::Gate => {
                     // Gate should be resolved by evaluate() — safety net
-                    let reason = result.reason.unwrap_or_else(|| "Gate check failed".into());
+                    let reason = reason.unwrap_or_else(|| "Gate check failed".into());
                     Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "DENIED by Signet: {reason}"
                     ))]))
                 }
                 Decision::Ensure => {
-                    let reason = result
-                        .reason
-                        .unwrap_or_else(|| "Ensure checks cannot run in proxy mode".into());
+                    let reason =
+                        reason.unwrap_or_else(|| "Ensure checks cannot run in proxy mode".into());
                     Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "DENIED by Signet: {reason}"
                     ))]))

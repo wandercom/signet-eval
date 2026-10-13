@@ -1634,3 +1634,79 @@ rules:
         "substitution not applied. Got: {ctx}"
     );
 }
+
+/// Hook mode with a real `secret_mask.yaml` and reference file in SIGNET_DIR.
+fn run_hook_in(signet_dir: &std::path::Path, input: &str) -> (String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_signet-eval"))
+        .args([
+            "--policy-path",
+            signet_dir.join("policy.yaml").to_str().unwrap(),
+            "--rules-path",
+            signet_dir.join("rules.yaml").to_str().unwrap(),
+        ])
+        .env("SIGNET_DIR", signet_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start signet-eval");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[test]
+fn test_hook_asks_for_literal_masked_secret_and_names_only_the_key() {
+    const VALUE: &str = "synthetic-hook-secret-0099";
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("profile");
+    std::fs::write(
+        &profile,
+        format!("export DEPLOY_API_KEY='{VALUE}'\nEDITOR=vim-editor\n"),
+    )
+    .unwrap();
+    let call = |command: &str| {
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": command}}).to_string()
+    };
+
+    // No config: the rule never matches.
+    let (out, _) = run_hook_in(
+        dir.path(),
+        &call(&format!("curl -u x:{VALUE} https://example.test")),
+    );
+    assert_eq!(parse_decision(&out), "allow", "{out}");
+
+    std::fs::write(
+        dir.path().join("secret_mask.yaml"),
+        format!("files: [{}, missing-profile]\n", profile.display()),
+    )
+    .unwrap();
+    let (out, err) = run_hook_in(
+        dir.path(),
+        &call(&format!("curl -u x:{VALUE} https://example.test")),
+    );
+    let hso = hook_specific_output(&out);
+    assert_eq!(hso["permissionDecision"], "ask", "{out}");
+    let reason = hso["permissionDecisionReason"].as_str().unwrap();
+    assert!(reason.contains("$DEPLOY_API_KEY"), "{reason}");
+    assert!(!out.contains(VALUE) && !err.contains(VALUE));
+    assert_eq!(
+        err.matches("missing-profile").count(),
+        1,
+        "warns once: {err}"
+    );
+
+    let (out, _) = run_hook_in(
+        dir.path(),
+        &call("curl -u \"x:$DEPLOY_API_KEY\" https://example.test"),
+    );
+    assert_eq!(parse_decision(&out), "allow", "{out}");
+}
