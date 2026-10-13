@@ -361,6 +361,12 @@ impl SecretMask {
         }
         Some((names, self.files.len()))
     }
+
+    /// Configured reference file paths, resolved. Never reads the files.
+    pub fn files(&mut self) -> Vec<PathBuf> {
+        self.reload_config();
+        self.files.iter().map(|file| file.path.clone()).collect()
+    }
 }
 
 fn global() -> &'static Mutex<SecretMask> {
@@ -390,6 +396,37 @@ pub(crate) fn set_test_pairs(pairs: Option<&[(&str, &str)]>) {
         Arc::new(build_table(&owned))
     });
     TEST_TABLE.with(|cell| *cell.borrow_mut() = table);
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FILES: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replace the configured reference files on this test thread (None restores the config).
+#[cfg(test)]
+pub(crate) fn set_test_files(files: Option<&[&str]>) {
+    let files = files.map(|files| files.iter().map(PathBuf::from).collect());
+    TEST_FILES.with(|cell| *cell.borrow_mut() = files);
+}
+
+/// Resolved paths of the configured reference files; empty when masking is off.
+/// Policy uses them to keep agents from reading the files at all.
+pub fn reference_files() -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(files) = TEST_FILES.with(|cell| cell.borrow().clone()) {
+        return files;
+    }
+    let mut mask = match global().lock() {
+        Ok(mask) => mask,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let path = config_path();
+    if mask.config_path != path {
+        *mask = SecretMask::new(path);
+    }
+    mask.files()
 }
 
 /// The active replacement table; empty when masking is off.

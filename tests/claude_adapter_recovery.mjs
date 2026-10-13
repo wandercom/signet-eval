@@ -5,8 +5,9 @@
  * Node >= 23.6 strips TypeScript natively. The Tester does not execute the SUT.
  *
  * Oracle: Validator's authorized incident-repair brief, 2026-09-24:
- * R1 Genuine disabled owner is neutral on all hooks without session.start,
+ * R1 Genuine disabled owner turns policy off on all hooks without session.start,
  *    after prior failure/conflict, and despite stale adapter revision/conflict.
+ *    Prompt and output redaction stay on; disabled never blocks.
  * R2 Later valid owner checks recover initialization/transient/conflict failures.
  * R3 Active legacy conflict and missing/invalid owners deny effects with safe,
  *    specific diagnosis. Only genuine protocol owner can attest disablement.
@@ -14,6 +15,8 @@
  * R5 Policy-owner unavailability never drops the human recovery prompt; attempt
  *    sanitizer when available. No new prompt-denial rule is introduced here.
  * R6 Output sanitation failure withholds the result, never repeats the tool.
+ * R7 Disabled redacts prompts and tool output; a sanitizer failure then returns
+ *    the original with a warning instead of withholding it.
  * Existing contract: adapters/claude-function/README.md, Explicit activation,
  * Redaction boundary, and Kindex admission protocol.
  *
@@ -99,11 +102,18 @@ function harness(initial = ACTIVE, config = {}, session = {}) {
     },
   };
 }
-function neutral(observation, requirement) {
+const REDACTING = new Set(['prompt.submit', 'tool.call']);
+function neutral(observation, requirement, hook) {
   assert.equal(observation.nextCalls.length, 1, `${requirement}: host continuation must run once`);
   assert.deepEqual(observation.nextCalls[0], [observation.event], `${requirement}: preserve event unchanged`);
-  assert.strictEqual(observation.output, observation.hostResult, `${requirement}: preserve host result unchanged`);
-  assert(!observation.calls.some(x => x.action === 'policy' || x.action === 'redact'), `${requirement}: disabled policy must be neutral`);
+  assert(!observation.calls.some(x => x.action === 'policy'), `${requirement}: disabled policy must not evaluate`);
+  if (REDACTING.has(hook)) {
+    assert.deepEqual(observation.output, observation.hostResult, `${requirement}: preserve host result shape`);
+    assert(observation.calls.some(x => x.action === 'redact'), `${requirement}: disabled keeps redaction`);
+  } else {
+    assert.strictEqual(observation.output, observation.hostResult, `${requirement}: preserve host result unchanged`);
+    assert(!observation.calls.some(x => x.action === 'redact'), `${requirement}: nothing to redact`);
+  }
 }
 function refused(observation, diagnosis, requirement) {
   assert(observation.ownerCalls.length > 0, `${requirement}: refusal must reach owner check`);
@@ -115,18 +125,18 @@ function refused(observation, diagnosis, requirement) {
 
 for (const hook of Object.keys(EVENTS)) {
   test(`RED R1 disabled without startup: ${hook}`, async () => {
-    neutral(await harness(DISABLED).invoke(hook), 'R1');
+    neutral(await harness(DISABLED).invoke(hook), 'R1', hook);
   });
   test(`RED R1 disabled wins over stale revision and legacy conflict: ${hook}`, async () => {
     const h = harness({ ...DISABLED, adapter_revision: 'older-owner-revision', legacy_handlers: 2 });
-    neutral(await h.invoke(hook), 'R1');
+    neutral(await h.invoke(hook), 'R1', hook);
   });
   for (const [label, bad] of [['transport failure', FAILURE], ['legacy conflict', { ...ACTIVE, legacy_handlers: 1 }]]) {
     test(`RED R1 disabled recovers after startup ${label}: ${hook}`, async () => {
       const h = harness(bad);
       await h.invoke('session.start');
       h.state.owner = { ...DISABLED, adapter_revision: 'older-owner-revision', legacy_handlers: 1 };
-      neutral(await h.invoke(hook), 'R1');
+      neutral(await h.invoke(hook), 'R1', hook);
     });
   }
 }
@@ -205,6 +215,29 @@ test('GREEN R6 successful output sanitation preserves structured shape', async (
   assert.equal(observed.nextCalls.length, 1, 'R6: admitted tool executes once');
   assert.deepEqual(observed.output, { result: { stdout: '[REDACTED]', stderr: '', interrupted: false } }, 'R6: host sees sanitized replacement preserving result shape');
 });
+
+test('RED R7 disabled still redacts tool output and prompts', async () => {
+  const h = harness(DISABLED);
+  const tool = await h.invoke('tool.call', EVENTS['tool.call'], { result: { stdout: CANARY, stderr: '', interrupted: false } });
+  assert.equal(tool.nextCalls.length, 1, 'R7: tool executes once');
+  assert.deepEqual(tool.output, { result: { stdout: '[REDACTED]', stderr: '', interrupted: false } }, 'R7: output redacted while disabled');
+  const prompt = await h.invoke('prompt.submit', { text: `token ${CANARY}` });
+  assert.equal(prompt.nextCalls[0][0].text, 'token [REDACTED]', 'R7: prompt redacted while disabled');
+  assert(!h.state.calls.some(x => x.action === 'policy'), 'R7: policy stays off');
+});
+for (const failure of [FAILURE, MALFORMED, { protocol_version: 1, owner: 'other-service', sanitizer_revision: 'signet-redaction-v1', value: { stdout: 'x' } }]) {
+  test(`RED R7 disabled sanitizer failure ${String(failure)} never blocks`, async () => {
+    const h = harness(DISABLED);
+    h.state.redact = failure;
+    const tool = await h.invoke('tool.call', EVENTS['tool.call'], { result: { stdout: 'hello', stderr: '', interrupted: false } });
+    assert.equal(tool.nextCalls.length, 1, 'R7: tool executes exactly once');
+    assert.strictEqual(tool.output, tool.hostResult, 'R7: disabled returns the original result');
+    assert.equal(tool.output?.deny, undefined, 'R7: disabled never withholds');
+    const prompt = await h.invoke('prompt.submit');
+    assert.equal(prompt.nextCalls[0][0].text, EVENTS['prompt.submit'].text, 'R7: prompt still delivered');
+    assert(h.state.statuses.some(([text]) => /without Signet redaction/.test(text)), 'R7: warn that redaction did not run');
+  });
+}
 
 for (const hook of ['classic.PreToolUse', 'tool.call']) {
   test(`GREEN R3 legacy conflict introduced mid-session refuses: ${hook}`, async () => {

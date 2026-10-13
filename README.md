@@ -408,6 +408,17 @@ reasons and alternatives can use the `{masked_keys}` placeholder, which expands
 to the matched key names. `signet-eval status` reports the masked key names and
 file count.
 
+Masking keeps values out of what signet-eval shows; it cannot stop a host from
+sending a tool's output to the model. So the locked rule
+`protect_secret_reference_files` denies any tool call whose command or path
+names a reference file: `cat ~/.profile`, `grep KEY $HOME/.profile`, the Read
+tool on it, an edit or patch of it, or the bare name when the command runs in
+(or `cd`s to) its directory. `source FILE` and `. FILE` stay allowed because
+they print nothing; use the loaded variables by name. Written content, prompts
+and descriptions are not inspected, so documentation may mention the file. The
+match is lexical: globs, symlinks, copies made outside the agent, or a recursive
+search of a parent directory are not caught. It never matches without a config.
+
 ## Encrypted Vault
 
 Three-tier encrypted storage with passphrase-derived key hierarchy (Argon2id + AES-256-GCM):
@@ -445,6 +456,7 @@ signet-eval ships with locked rules that prevent an AI agent from disabling its 
 8. **protect_checks_dir** — Denies agent-side replacement of trusted ENSURE scripts
 9. **protect_vault_passphrase** — Reserves vault setup and unlock operations for the human
 10. **protect_signet_symlink** — Denies symlink bypasses targeting protected enforcement surfaces
+11. **protect_secret_reference_files** — Denies reading the env files named in `secret_mask.yaml`; `source` stays allowed (see Secret masking)
 
 These rules are:
 - **Locked** — MCP tools refuse to remove, edit, or reorder them

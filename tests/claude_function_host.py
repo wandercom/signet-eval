@@ -183,7 +183,7 @@ rows = [json.loads(line) for line in result.stdout.splitlines() if line.startswi
 results = [part for row in rows for part in row.get("message", {}).get("content", []) if isinstance(part, dict) and part.get("type") == "tool_result"]
 assert len(results) == (2 if args.kindex_plugin else 1), "missing tool result"
 assert "does not match its output shape" not in result.stdout, "invalid replacement result"
-assert summary["raw_prompt_in_api"] == args.disable_policy, "prompt redaction/disabled mismatch"
+assert not summary["raw_prompt_in_api"], "prompt redaction must hold while policy is disabled"
 if args.kindex_plugin:
     refused = args.deny_task or args.disable_before_task or args.deny_native_secret
     assert bool(results[0].get("is_error")) == refused, "task admission decision mismatch"
@@ -208,5 +208,5 @@ elif args.deny_bash or args.bash_error:
         assert marker.read_text() == "executed\n", "shell effect missing or command executed more than once"
 else:
     assert not results[0].get("is_error"), "Bash did not execute"
-    assert summary["raw_output_in_api"] == (args.disable_policy or args.disable_before_task), "output redaction/disabled mismatch"
+    assert not summary["raw_output_in_api"], "output redaction must hold while policy is disabled"
 print("PASS: host schemas, projection boundaries, admission, and durable effects checked")

@@ -3,7 +3,8 @@ import type { Register } from "claude-code";
 const REVISION = "claude-functions-2.1.280-v1";
 
 // Only fixed categories leave this parser: owner-provided error/reason text is
-// never a diagnostic. Disabled is neutral even across adapter upgrades.
+// never a diagnostic. Disabled turns policy off, never redaction, and never
+// blocks, even across adapter upgrades.
 function ownerState(stdout: string): string {
   try {
     const state = JSON.parse(stdout);
@@ -26,6 +27,8 @@ function ownerState(stdout: string): string {
   } catch { return "invalid_response"; }
 }
 
+const DISABLED = "Signet-eval: policy disabled; output redaction on";
+
 function blocked(state: string): string {
   return `Signet-eval: ${state}. Tool execution is blocked. Run signet-eval status in a terminal to inspect the selected owner; callbacks recheck automatically.`;
 }
@@ -46,7 +49,7 @@ export const register: Register = (on, options) => {
         if (output.exitCode === 0) state = ownerState(output.stdout);
       }
     } catch { /* Report this attempt; never latch failure into later callbacks. */ }
-    $.ui.status(state === "active" ? "Signet-eval: policy + output redaction" : state === "disabled" ? "Signet-eval: disabled" : blocked(state));
+    $.ui.status(state === "active" ? "Signet-eval: policy + output redaction" : state === "disabled" ? DISABLED : blocked(state));
     return next(e);
   });
   on("prompt.submit", async ($, e, next) => {
@@ -62,11 +65,7 @@ export const register: Register = (on, options) => {
         if (output.exitCode === 0) state = ownerState(output.stdout);
       }
     } catch { /* Human recovery stays available while tools remain guarded. */ }
-    if (state === "disabled") {
-      $.ui.status("Signet-eval: disabled");
-      return next(e);
-    }
-    $.ui.status(state === "active" ? "Signet-eval: policy + output redaction" : blocked(state));
+    $.ui.status(state === "active" ? "Signet-eval: policy + output redaction" : state === "disabled" ? DISABLED : blocked(state));
     // The sanitizer needs no vault and can still work during a policy outage.
     let text = e.text;
     let sanitized = false;
@@ -80,7 +79,7 @@ export const register: Register = (on, options) => {
         }
       }
     } catch { /* Preserve the recovery prompt with an explicit warning below. */ }
-    if (!sanitized) $.ui.status(`Signet-eval: prompt_sanitizer_unavailable. This prompt will be sent without Signet redaction. ${state === "active" ? "Tool calls will recheck policy." : blocked(state)}`);
+    if (!sanitized) $.ui.status(`Signet-eval: prompt_sanitizer_unavailable. This prompt will be sent without Signet redaction. ${state === "active" ? "Tool calls will recheck policy." : state === "disabled" ? "Policy is disabled." : blocked(state)}`);
     return next({...e,text});
   });
   on("classic.PreToolUse", async ($, e, next) => {
@@ -140,18 +139,24 @@ export const register: Register = (on, options) => {
         if (output.exitCode === 0) state = ownerState(output.stdout);
       }
     } catch { /* No tool effect has run. */ }
-    if (state === "disabled") return next(e);
-    if (state !== "active") return {deny:blocked(state)};
+    if (state !== "active" && state !== "disabled") return {deny:blocked(state)};
     // Keep the host invocation outside the owner/sanitizer error handlers.
     const result = await next(e);
+    // Active withholds a result it cannot sanitize. Disabled must never block,
+    // so it returns the raw result and says redaction did not run.
+    const unsanitized = async (failure: string) => {
+      if (state === "active") return {deny:`Signet-eval: ${failure}. Tool ran, but its result was withheld. Do not retry the tool without checking its effects.`};
+      try { await $.ui.status(`Signet-eval: ${failure}. Policy is disabled, so this tool result was returned without Signet redaction.`); } catch { /* The result still returns. */ }
+      return result;
+    };
     let failure = "output_sanitizer_unavailable";
     try {
       const sanitized = await $.process.run([executable,"integration","redact"], {stdin:JSON.stringify({value:result}),timeoutMs:5000});
-      if (sanitized.exitCode !== 0) return {deny:"Signet-eval: output_sanitizer_unavailable. Tool ran, but its result was withheld. Do not retry the tool without checking its effects."};
+      if (sanitized.exitCode !== 0) return unsanitized("output_sanitizer_unavailable");
       failure = "invalid_sanitizer_response";
       const output = JSON.parse(sanitized.stdout);
       if (output?.protocol_version !== 1 || output.owner !== "signet-eval" || output.sanitizer_revision !== "signet-redaction-v1" || !output.value || typeof output.value !== "object" || Array.isArray(output.value)) {
-        return {deny:"Signet-eval: invalid_sanitizer_response. Tool ran, but its result was withheld. Do not retry the tool without checking its effects."};
+        return unsanitized("invalid_sanitizer_response");
       }
       const safe = output.value;
       if (typeof safe.deny === "string") return {deny:safe.deny};
@@ -159,6 +164,6 @@ export const register: Register = (on, options) => {
       // Use the host's error channel instead of treating error text as a typed result.
       if (safe.deny !== undefined || safe.isError || safe.result === undefined) return {deny:typeof safe.text === "string" ? safe.text : "Signet-eval: tool_result_unavailable. The host returned without a successful tool result; inspect its effects before retrying."};
       return {result:safe.result,...(safe.context ? {context:safe.context} : {})};
-    } catch { return {deny:`Signet-eval: ${failure}. Tool ran, but its result was withheld. Do not retry the tool without checking its effects.`}; }
+    } catch { return unsanitized(failure); }
   });
 };
