@@ -2,7 +2,7 @@ domains:
   - signet-eval
 
 name: signet-eval
-description: Deterministic policy enforcement for AI agent tool calls. Rust single binary. Claude Code, Codex, Antigravity, and OpenCode hooks + MCP management server + MCP proxy.
+description: Deterministic policy enforcement for AI agent tool calls. Rust single binary. Claude Code, Codex, Antigravity, OpenCode, Cursor, and Muse Code hooks + MCP management server + MCP proxy.
 version: 3.14.0
 author: Wander
 license: MIT
