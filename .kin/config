@@ -7,7 +7,7 @@ version: 3.14.0
 author: Wander
 license: MIT
 repository: https://github.com/wandercom/signet-eval
-tags: signet, security, policy, ai-safety, claude-code, codex, antigravity, mcp, rust
+tags: signet, security, policy, ai-safety, claude-code, codex, antigravity, opencode, cursor, muse, mcp, rust
 audience: public
 
 work_policy:
