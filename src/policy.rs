@@ -2080,7 +2080,10 @@ pub fn self_protection_rules() -> Vec<PolicyRule> {
             name: "require_kindex_engagement_before_edits".into(),
             tool_pattern: "^(Edit|Write|NotebookEdit|apply_patch|write_to_file|replace_file_content|multi_replace_file_content|edit|write|patch)$".into(),
             conditions: vec![
-                "or(not(has_current_session()), not(has_recent_action('mcp__kindex__tag_start|mcp__kindex__tag_resume|mcp__kindex__search|mcp__kindex__context|mcp__kindex__ask', 200)))".into(),
+                // Factory lanes name their own Kindex server `lane-kindex` (Cursor, Antigravity),
+                // and Cursor reports MCP calls through Claude-compatible hooks as `MCP:<tool>`
+                // with no server name, so only Kindex's distinctive tag tools count there.
+                "or(not(has_current_session()), not(has_recent_action('mcp__kindex__tag_start|mcp__kindex__tag_resume|mcp__kindex__search|mcp__kindex__context|mcp__kindex__ask|mcp__lane-kindex__tag_start|mcp__lane-kindex__tag_resume|mcp__lane-kindex__search|mcp__lane-kindex__context|mcp__lane-kindex__ask|MCP:tag_start|MCP:tag_resume', 200)))".into(),
             ],
             action: Decision::Deny,
             locked: true,
@@ -4866,6 +4869,35 @@ rules:
             kindex_result.matched_rule.as_deref(),
             Some("prefer_persistent_task_store")
         );
+    }
+
+    #[test]
+    fn test_kindex_engagement_counts_lane_and_cursor_kindex_names() {
+        // Seen in Factory runs: a Cursor lane's tag_start/search were logged as
+        // `MCP:tag_start`/`MCP:search` and its edits were denied for good.
+        let policy = default_policy();
+        let edit = make_call("Write", serde_json::json!({"file_path": "/repo/src/a.ts"}));
+        for (logged, engages) in [
+            ("MCP:tag_start", true),
+            ("MCP:tag_resume", true),
+            ("mcp__lane-kindex__tag_start", true),
+            ("mcp__lane-kindex__search", true),
+            ("MCP:search", false),
+            ("mcp__other__tag_start", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let key = crate::vault::derive_master_key("testpass", &[0u8; 16]);
+            let vault = crate::vault::Vault::new(key, dir.path().join("state.db"));
+            crate::vault::set_test_session_id(Some("cursor-lane"));
+            vault.log_action(logged, "allow", "", 0.0, "{}");
+            let result = evaluate(&edit, &policy, Some(&vault));
+            assert_eq!(
+                result.matched_rule.as_deref() == Some("require_kindex_engagement_before_edits"),
+                !engages,
+                "{logged}"
+            );
+        }
+        crate::vault::clear_test_session_id();
     }
 
     #[test]

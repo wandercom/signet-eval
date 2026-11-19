@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- The locked `require_kindex_engagement_before_edits` prerequisite now also counts a Factory lane's own Kindex server (`mcp__lane-kindex__tag_start`, `..._tag_resume`, `..._search`, `..._context`, `..._ask`) and Cursor's Claude-compatible names for Kindex's tag tools (`MCP:tag_start`, `MCP:tag_resume`, which carry no server name). A Cursor lane that started its Kindex tag could otherwise never edit. Generic names such as `MCP:search` still do not count.
+
 ### Added
 - Cursor adapter (`--adapter cursor`) for `preToolUse`, `beforeShellExecution`, `beforeMCPExecution`, and `beforeReadFile`, with a sample `hooks/cursor-hooks.json`. Shell calls map to `Bash`, MCP calls carry their server identity, and Signet `ASK` reaches Cursor's approval prompt only for shell commands; elsewhere it denies. Malformed payloads deny in Cursor's response shape.
 - Muse Code adapter (`--adapter muse`) for `PreToolUse` and `PermissionRequest`, with a sample `hooks/muse-hooks.json`. Muse native tool names map to Signet's canonical names; `ALLOW` emits no output because Muse rejects a bare allow, and `ASK` denies because Muse ignores it.
